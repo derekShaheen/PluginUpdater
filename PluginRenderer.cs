@@ -1,10 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using ExileCore2;
 using ExileCore2.Shared.Attributes;
+using ExileCore2.Shared.Interfaces;
 using ImGuiNET;
 
 namespace PluginUpdater
@@ -51,7 +53,7 @@ namespace PluginUpdater
         private readonly ConsoleLog _consoleLog = new();
         private readonly PluginUpdaterSettings _settings;
         private GitUpdater _updater;
-        
+
         private bool _isUpdating;
         private readonly Dictionary<string, bool> _updatingPlugins = [];
         private readonly Dictionary<string, bool> _revertingPlugins = [];
@@ -125,7 +127,8 @@ namespace PluginUpdater
                 int updateCount = plugins.Count(p => p.CurrentCommit != p.LatestCommit);
                 if (updateCount > 0)
                 {
-                    _consoleLog.AddNotificationMessage("PendingUpdates", $"There is {updateCount} plugin {(updateCount > 1 ? "updates" : "update")} pending.", ConsoleLog.ColorInfo);
+                    _consoleLog.AddNotificationMessage("PendingUpdates", $"There is {updateCount} plugin {(updateCount > 1 ? "updates" : "update")} pending.",
+                        ConsoleLog.ColorInfo);
                 }
             }
             catch (Exception e)
@@ -140,7 +143,7 @@ namespace PluginUpdater
             }
         }
 
-        private async Task UpdatePluginAsync(string pluginName)
+        private async Task UpdatePluginAsync(string pluginName, bool force)
         {
             if (_updatingPlugins.TryGetValue(pluginName, out bool isUpdating) && isUpdating)
                 return;
@@ -149,7 +152,15 @@ namespace PluginUpdater
             {
                 _updatingPlugins[pluginName] = true;
                 _consoleLog.LogInfo($"Starting update for {pluginName}...");
-                await _updater.UpdatePluginAsync(pluginName);
+                if (force)
+                {
+                    await _updater.ForceUpdatePluginAsync(pluginName);
+                }
+                else
+                {
+                    await _updater.UpdatePluginAsync(pluginName);
+                }
+
                 var plugin = _updater.GetPluginInfo().FirstOrDefault(p => p.Name == pluginName);
                 if (plugin != null && !string.IsNullOrEmpty(plugin.LastMessage))
                 {
@@ -162,6 +173,7 @@ namespace PluginUpdater
                         }
                     }
                 }
+
                 _consoleLog.LogSuccess($"Successfully updated {pluginName}");
                 PluginUpdater.Instance.RemoveNotification("", "PendingUpdates");
             }
@@ -191,7 +203,7 @@ namespace PluginUpdater
 
                 foreach (var plugin in outdatedPlugins)
                 {
-                    await UpdatePluginAsync(plugin.Name);
+                    await UpdatePluginAsync(plugin.Name, false);
                 }
 
                 PluginUpdater.Instance.RemoveNotification("", "PendingUpdates");
@@ -301,10 +313,13 @@ namespace PluginUpdater
                         if (isSelected)
                             ImGui.SetItemDefaultFocus();
                     }
+
                     ImGui.EndCombo();
                 }
             }
         }
+
+        private string _pluginNameFilter = "";
 
         private void RenderUpdateButtons()
         {
@@ -316,12 +331,6 @@ namespace PluginUpdater
                     : "Checking For Updates...";
                 ImGui.Button(progressText);
 
-                if (_totalProgress > 0)
-                {
-                    float progress = (float)_currentProgress / _totalProgress;
-                    ImGui.ProgressBar(progress, new System.Numerics.Vector2(-1, 2));
-                }
-
                 ImGui.EndDisabled();
             }
             else
@@ -331,6 +340,13 @@ namespace PluginUpdater
                     _currentProgress = 0;
                     _totalProgress = 0;
                     _ = UpdateGitInfoAsync();
+                }
+
+                ImGui.SameLine();
+
+                if (ImGui.Button("Refresh (local)"))
+                {
+                    _updater.UpdateLocal();
                 }
 
                 var plugins = _updater.GetPluginInfo();
@@ -361,16 +377,27 @@ namespace PluginUpdater
                     }
                 }
             }
+
+            ImGui.SameLine();
+
+            ImGui.InputTextWithHint("##filter", "Filter", ref _pluginNameFilter, 200);
+
+            if(_isUpdating && _totalProgress > 0)
+            {
+                float progress = (float)_currentProgress / _totalProgress;
+                ImGui.ProgressBar(progress, new System.Numerics.Vector2(-1, 2));
+            }
         }
+
 
         private void RenderPluginsTable()
         {
             var tableFlags = ImGuiTableFlags.Borders |
-                            ImGuiTableFlags.Resizable |
-                            ImGuiTableFlags.SizingFixedFit |
-                            ImGuiTableFlags.ScrollY |
-                            ImGuiTableFlags.ScrollX |
-                            ImGuiTableFlags.RowBg;
+                             ImGuiTableFlags.Resizable |
+                             ImGuiTableFlags.SizingFixedFit |
+                             ImGuiTableFlags.ScrollY |
+                             ImGuiTableFlags.ScrollX |
+                             ImGuiTableFlags.RowBg;
 
             var plugins = _updater.GetPluginInfo();
 
@@ -409,14 +436,16 @@ namespace PluginUpdater
         {
             var plugins = _updater.GetPluginInfo();
 
-            foreach (var pluginInfo in plugins.OrderBy(x => x.Name))
+            foreach (var pluginInfo in plugins
+                         .Where(x => string.IsNullOrEmpty(_pluginNameFilter) || x.Name.Contains(_pluginNameFilter, StringComparison.OrdinalIgnoreCase))
+                         .OrderBy(x => x.Name))
             {
                 try
                 {
                     ImGui.TableNextRow();
                     ImGui.TableNextColumn();
                     RenderPluginName(pluginInfo);
-                    RenderBranchSelector(pluginInfo).Wait();
+                    RenderBranchSelector(pluginInfo);
                     RenderCommitInfo(pluginInfo);
                     RenderActionButtons(pluginInfo);
                 }
@@ -433,7 +462,7 @@ namespace PluginUpdater
             ImGui.TableNextColumn();
         }
 
-        private async Task RenderBranchSelector(PluginInfo pluginInfo)
+        private void RenderBranchSelector(PluginInfo pluginInfo)
         {
             if (string.IsNullOrEmpty(pluginInfo.CurrentBranch))
             {
@@ -442,29 +471,21 @@ namespace PluginUpdater
             }
 
             ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - 5);
-            if (ImGui.BeginCombo($"##branch_{pluginInfo.Name}", pluginInfo.SelectedBranch))
+            if (ImGui.BeginCombo($"##branch_{pluginInfo.Name}", pluginInfo.CurrentBranch))
             {
                 foreach (var branch in pluginInfo.AvailableBranches)
                 {
-                    bool isSelected = branch == pluginInfo.SelectedBranch;
+                    bool isSelected = branch == pluginInfo.CurrentBranch;
                     if (ImGui.Selectable(branch, isSelected))
                     {
                         if (branch != pluginInfo.CurrentBranch)
                         {
-                            try
+                            _consoleLog.LogInfo($"Switching {pluginInfo.Name} to branch {branch}...");
+                            _ = Task.Run(async () =>
                             {
-                                _consoleLog.LogInfo($"Switching {pluginInfo.Name} to branch {branch}...");
-                                _ = Task.Run(async () =>
-                                {
-                                    await _updater.ChangeBranchAsync(pluginInfo.Name, branch);
-                                    await _updater.UpdateGitInfoAsync();
-                                    _consoleLog.LogSuccess($"Successfully switched {pluginInfo.Name} to branch {branch}");
-                                });
-                            }
-                            catch (Exception ex)
-                            {
-                                _consoleLog.LogError($"Failed to switch branch: {ex.Message}");
-                            }
+                                await _updater.ChangeBranchAsync(pluginInfo.Name, branch);
+                                _consoleLog.LogSuccess($"Successfully switched {pluginInfo.Name} to branch {branch}");
+                            });
                         }
                     }
 
@@ -473,8 +494,10 @@ namespace PluginUpdater
                         ImGui.SetItemDefaultFocus();
                     }
                 }
+
                 ImGui.EndCombo();
             }
+
             ImGui.TableNextColumn();
         }
 
@@ -499,7 +522,7 @@ namespace PluginUpdater
                 text += $" ({pluginInfo.UncommittedChangeCount} uncommitted changes)";
             }
 
-            ImGui.Text(text);
+            ImGui.TextWrapped(text);
             ImGui.TableNextColumn();
         }
 
@@ -525,6 +548,7 @@ namespace PluginUpdater
                         }
                     }
                 }
+
                 _consoleLog.LogSuccess($"Successfully reverted {pluginName}");
             }
             catch (Exception e)
@@ -541,44 +565,88 @@ namespace PluginUpdater
 
         private void RenderActionButtons(PluginInfo pluginInfo)
         {
-            if (string.IsNullOrEmpty(pluginInfo.CurrentCommit))
+            if (!string.IsNullOrEmpty(pluginInfo.CurrentCommit))
             {
-                ImGui.TableNextColumn();
-                return;
-            }
+                bool isUpdating = _updatingPlugins.TryGetValue(pluginInfo.Name, out bool updating) && updating;
+                bool isReverting = _revertingPlugins.TryGetValue(pluginInfo.Name, out bool reverting) && reverting;
 
-            bool isUpdating = _updatingPlugins.TryGetValue(pluginInfo.Name, out bool updating) && updating;
-            bool isReverting = _revertingPlugins.TryGetValue(pluginInfo.Name, out bool reverting) && reverting;
-
-            if (pluginInfo.CurrentCommit != pluginInfo.LatestCommit)
-            {
-                ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0, 0.5f, 0, 1.0f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0, 0.7f, 0, 1.0f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0, 0.3f, 0, 1.0f));
-                ImGui.BeginDisabled(isReverting || isUpdating);
-                if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Update##{pluginInfo.Name}"))
+                if (pluginInfo.CurrentCommit != pluginInfo.LatestCommit)
                 {
-                    _ = UpdatePluginAsync(pluginInfo.Name);
+                    ImGui.BeginDisabled(isReverting || isUpdating);
+                    if (pluginInfo.AheadBy == 0 || pluginInfo.BehindBy != 0)
+                    {
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0, 0.5f, 0, 1.0f)))
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0, 0.7f, 0, 1.0f)))
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0, 0.3f, 0, 1.0f)))
+                            if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Update##{pluginInfo.Name}"))
+                            {
+                                _ = UpdatePluginAsync(pluginInfo.Name, false);
+                            }
+
+                        ImGui.SameLine();
+                    }
+
+                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f)))
+                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f)))
+                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f)))
+                        if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Force update##{pluginInfo.Name}"))
+                        {
+                            ImGui.OpenPopup($"Force update plugin {pluginInfo.Name}");
+                        }
+
+                    if (ImGui.BeginPopupModal($"Force update plugin {pluginInfo.Name}"))
+                    {
+                        ImGui.Text($"Are you sure you want to for update the plugin '{pluginInfo.Name}'?\nLocal changes will be lost");
+                        ImGui.Spacing();
+
+                        float buttonWidth = 120;
+                        float spacing = 20;
+                        float totalWidth = buttonWidth * 2 + spacing;
+                        ImGui.SetCursorPosX((ImGui.GetWindowSize().X - totalWidth) * 0.5f);
+
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f)))
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f)))
+                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f)))
+
+                            if (ImGui.Button("Force update", new System.Numerics.Vector2(buttonWidth, 0)))
+                            {
+                                ImGui.CloseCurrentPopup();
+                                _ = UpdatePluginAsync(pluginInfo.Name, true);
+                            }
+
+                        ImGui.SameLine(0, spacing);
+                        if (ImGui.Button("Cancel", new System.Numerics.Vector2(buttonWidth, 0)))
+                        {
+                            ImGui.CloseCurrentPopup();
+                        }
+
+                        ImGui.EndPopup();
+                    }
+
+                    ImGui.EndDisabled();
+                    ImGui.SameLine();
+                }
+
+
+                ImGui.BeginDisabled(isReverting || isUpdating);
+                if (ImGui.Button(isReverting ? $"Reverting...##{pluginInfo.Name}" : $"Revert##{pluginInfo.Name}"))
+                {
+                    _ = RevertPluginAsync(pluginInfo.Name);
                 }
 
                 ImGui.EndDisabled();
 
-                ImGui.PopStyleColor(3);
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip($"Revert to the previous commit {pluginInfo.PreviousCommit ?? "HEAD~1"}");
+                }
+
                 ImGui.SameLine();
             }
 
-
-            ImGui.BeginDisabled(isReverting || isUpdating);
-            if (ImGui.Button(isReverting ? $"Reverting...##{pluginInfo.Name}" : $"Revert##{pluginInfo.Name}"))
+            if (ImGui.Button($"Open folder##{pluginInfo.Name}"))
             {
-                _ = RevertPluginAsync(pluginInfo.Name);
-            }
-
-            ImGui.EndDisabled();
-
-            if (ImGui.IsItemHovered())
-            {
-                ImGui.SetTooltip($"Revert to the previous commit {pluginInfo.PreviousCommit ?? "HEAD~1"}");
+                Process.Start("explorer.exe", pluginInfo.Path);
             }
 
             ImGui.TableNextColumn();
@@ -619,7 +687,7 @@ namespace PluginUpdater
 
             ImGui.Spacing();
             ImGui.TextWrapped("Enter the URL of a Git repository to clone. " +
-                             "The repository will be cloned into the Plugins\\Source folder.");
+                              "The repository will be cloned into the Plugins\\Source folder.");
         }
 
         private async Task CloneRepositoryAsync(string repoUrl)
@@ -718,16 +786,17 @@ namespace PluginUpdater
                     _loadError = string.Empty;
                     _ = LoadRepositoriesAsync();
                 }
+
                 return;
             }
 
             var tableFlags = ImGuiTableFlags.Borders |
-                            ImGuiTableFlags.Resizable |
-                            ImGuiTableFlags.SizingFixedFit |
-                            ImGuiTableFlags.ScrollX |
-                            ImGuiTableFlags.ScrollY |
-                            ImGuiTableFlags.RowBg |
-                            ImGuiTableFlags.Hideable;
+                             ImGuiTableFlags.Resizable |
+                             ImGuiTableFlags.SizingFixedFit |
+                             ImGuiTableFlags.ScrollX |
+                             ImGuiTableFlags.ScrollY |
+                             ImGuiTableFlags.RowBg |
+                             ImGuiTableFlags.Hideable;
 
             var installedPlugins = _updater.GetPluginInfo();
 
@@ -783,6 +852,7 @@ namespace PluginUpdater
                 {
                     lastUpdated = DateTime.Parse(lastUpdated).ToString("yyyy-MM-dd");
                 }
+
                 ImGui.Text(lastUpdated);
 
                 ImGui.TableNextColumn();
@@ -872,6 +942,7 @@ namespace PluginUpdater
                         ImGui.CloseCurrentPopup();
                     }
                 }
+
                 ImGui.PopStyleColor(3);
 
                 ImGui.SameLine(0, spacing);

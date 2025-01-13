@@ -21,13 +21,14 @@ namespace PluginUpdater
         public string CurrentCommit { get; set; } = "";
         public string LatestCommit { get; set; } = "";
         public string BehindAhead { get; set; } = "";
+        public int BehindBy { get; set; } = 0;
+        public int AheadBy { get; set; } = 0;
         public string LastMessage { get; set; } = "";
         public string LatestCommitMessage { get; set; }
         public string PreviousCommit { get; set; }
         public int UncommittedChangeCount { get; set; }
         public List<string> AvailableBranches { get; set; } = new();
         public string CurrentBranch { get; set; }
-        public string SelectedBranch { get; set; }
     }
 
     public class GitUpdater : IDisposable
@@ -69,16 +70,33 @@ namespace PluginUpdater
         {
             _pluginManager = pluginManager;
             _pluginFolder = pluginManager.SourcePluginDirectoryPath;
-            var folders = GetGitPlugins();
-            foreach (var pluginInfo in folders)
-            {
-                _pluginInfo[pluginInfo.Name] = pluginInfo;
-            }
+            UpdateLocal();
         }
 
         private static PluginInfo CreatePluginInfo(string name, string folder)
         {
             return new PluginInfo { Name = name, Path = folder };
+        }
+
+        public void UpdateLocal()
+        {
+            _pluginInfo.Clear();
+
+            var folders = GetGitPlugins().ToList();
+
+            foreach (var pluginInfo in folders)
+            {
+                try
+                {
+                    using var repo = new Repository(pluginInfo.Path);
+                    SetPluginInfo(pluginInfo, repo);
+                    _pluginInfo[pluginInfo.Name] = pluginInfo;
+                }
+                catch (Exception e)
+                {
+                    DebugWindow.LogError($"Error processing {pluginInfo.Path}: {e}");
+                }
+            }
         }
 
         public async Task UpdateGitInfoAsync()
@@ -141,9 +159,13 @@ namespace PluginUpdater
                     var ahead = repository.Head.TrackingDetails.AheadBy ?? 0;
                     var behind = repository.Head.TrackingDetails.BehindBy ?? 0;
                     plugin.BehindAhead = $"{behind} behind, {ahead} ahead";
+                    plugin.BehindBy = behind;
+                    plugin.AheadBy = ahead;
                 }
                 else
                 {
+                    plugin.BehindBy = 0;
+                    plugin.AheadBy = 0;
                     plugin.BehindAhead = "";
                 }
             }
@@ -162,31 +184,41 @@ namespace PluginUpdater
 
         private void SetBranchInfo(PluginInfo plugin, Repository repository)
         {
-            // Get all remote branches
-            var remoteBranches = repository.Branches
-                .Where(b => b.IsRemote)
-                .Where(b => !b.FriendlyName.EndsWith("/HEAD"))
-                .Select(b => b.FriendlyName.Replace("origin/", ""))
-                .Distinct();
-
             // Get all local branches
             var localBranches = repository.Branches
                 .Where(b => !b.IsRemote)
                 .Where(b => b.FriendlyName != "HEAD")
-                .Select(b => b.FriendlyName);
+                .ToList();
+
+            var trackedBranches = localBranches
+                .Select(x => x.RemoteName == null ||
+                             x.RemoteName.EndsWith(".git", StringComparison.OrdinalIgnoreCase) ||
+                             repository.Network.Remotes[x.RemoteName] == null
+                    ? null
+                    : x.TrackedBranch)
+                .Where(x => x != null)
+                .ToHashSet();
+
+            // Get all remote branches
+            var remoteBranches = repository.Branches
+                .Where(b => b.IsRemote)
+                .Where(b => !b.FriendlyName.EndsWith("/HEAD"))
+                .Except(trackedBranches)
+                .Distinct();
 
             // Combine and deduplicate branches
             plugin.AvailableBranches = localBranches
                 .Union(remoteBranches)
-                .OrderBy(b => b)
+                .Select(b => b.FriendlyName)
+                .Order()
                 .ToList();
             
             plugin.CurrentBranch = repository.Head.FriendlyName;
-            plugin.SelectedBranch = plugin.CurrentBranch;
         }
 
         private async Task UpdateGitInfoInternalAsync(CancellationToken cancellationToken)
         {
+            _pluginInfo.Clear();
             var folders = GetGitPlugins().ToList();
             var totalFolders = folders.Count;
             var currentFolder = 0;
@@ -202,6 +234,8 @@ namespace PluginUpdater
                     await Task.Run(() =>
                     {
                         using var repo = new Repository(pluginInfo.Path);
+                        SetPluginInfo(pluginInfo, repo);
+                        _pluginInfo[pluginInfo.Name] = pluginInfo;
 
                         var fetchOptions = new FetchOptions
                         {
@@ -211,12 +245,7 @@ namespace PluginUpdater
                         var branchName = repo.Head.FriendlyName;
                         var trackingBranch = repo.Head.TrackedBranch;
 
-                        var remote = (trackingBranch, repo.Head) switch
-                        {
-                            ({ RemoteName: { } remoteName }, _) => repo.Network.Remotes[remoteName],
-                            (_, { RemoteName: { } remoteName }) => repo.Network.Remotes[remoteName],
-                            _ => repo.Network.Remotes["updater_remote"] ?? repo.Network.Remotes["origin"] ?? repo.Network.Remotes.Single(),
-                        };
+                        var remote = GetHeadRemote(repo, false);
                         var refSpecs = remote.FetchRefSpecs.Select(r => r.Specification);
 
                         Commands.Fetch(repo, remote.Name, refSpecs, fetchOptions, null);
@@ -292,13 +321,8 @@ namespace PluginUpdater
                 {
                     using var repo = new Repository(folder.Path);
 
-                    var trackingBranch = repo.Head.TrackedBranch ?? throw new Exception("No tracking branch found");
-                    var remote = (trackingBranch, repo.Head) switch
-                    {
-                        ({ RemoteName: { } remoteName }, _) => repo.Network.Remotes[remoteName],
-                        (_, { RemoteName: { } remoteName }) => repo.Network.Remotes[remoteName],
-                        _ => repo.Network.Remotes["updater_remote"] ?? repo.Network.Remotes["origin"] ?? repo.Network.Remotes.Single(),
-                    };
+                    var remote = GetHeadRemote(repo);
+
                     var refSpecs = remote.FetchRefSpecs.Select(r => r.Specification);
                     Commands.Fetch(repo, remote.Name, refSpecs, new FetchOptions
                     {
@@ -325,6 +349,68 @@ namespace PluginUpdater
                     throw;
                 }
             });
+        }
+
+        public async Task ForceUpdatePluginAsync(string pluginName)
+        {
+            var folder = GetGitPlugins().FirstOrDefault(f => f.Name.Equals(pluginName, StringComparison.InvariantCultureIgnoreCase));
+            if (folder == null) return;
+
+            var plugin = _pluginInfo.GetValueOrDefault(pluginName);
+            if (plugin == null) return;
+
+            await Task.Run(() =>
+            {
+                try
+                {
+                    using var repo = new Repository(folder.Path);
+
+                    var remote = GetHeadRemote(repo);
+
+                    var refSpecs = remote.FetchRefSpecs.Select(r => r.Specification);
+                    Commands.Fetch(repo, remote.Name, refSpecs, new FetchOptions
+                    {
+                        CredentialsProvider = _credentialsHandler,
+                    }, null);
+
+                    var trackedBranch = repo.Head.TrackedBranch;
+                    if (repo.Head.Tip != trackedBranch.Tip)
+                    {
+                        repo.Reset(ResetMode.Hard, trackedBranch.Tip);
+                        plugin.LastMessage = $"Force updated to {trackedBranch.Tip.Id.Sha[..7]}";
+                    }
+                    else
+                    {
+                        plugin.LastMessage = "Already up to date";
+                    }
+
+                    SetPluginInfo(plugin, repo);
+
+                    DebugWindow.LogMsg($"{folder.Path} updated to {plugin.CurrentCommit}");
+                    DebugWindow.LogMsg(plugin.LastMessage);
+                }
+                catch (Exception ex)
+                {
+                    DebugWindow.LogError($"Error updating plugin {pluginName}: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        private static Remote GetHeadRemote(Repository repo, bool throwOnNoTracking = true)
+        {
+            var headTrackedBranch = repo.Head.TrackedBranch;
+            if (throwOnNoTracking && headTrackedBranch is null)
+            {
+                throw new Exception("No tracking branch found");
+            }
+
+            return (headTrackedBranch, repo.Head) switch
+            {
+                ({ RemoteName: { } remoteName }, _) => repo.Network.Remotes[remoteName],
+                (_, { RemoteName: { } remoteName }) => repo.Network.Remotes[remoteName],
+                _ => repo.Network.Remotes["updater_remote"] ?? repo.Network.Remotes["origin"] ?? repo.Network.Remotes.Single(),
+            };
         }
 
         private static string ExtractRepoNameAndBranch(string repoUrl, out string branch)
@@ -539,23 +625,37 @@ namespace PluginUpdater
                 using var repo = new Repository(pluginPath);
                 Branch branch;
 
-                // Fetch latest changes first
-                var remote = repo.Network.Remotes["origin"];
-                Commands.Fetch(repo, remote.Name, remote.FetchRefSpecs.Select(r => r.Specification), 
-                    new FetchOptions { CredentialsProvider = _credentialsHandler }, null);
+                foreach (var remote in repo.Network.Remotes)
+                {
+                    Commands.Fetch(repo, remote.Name, remote.FetchRefSpecs.Select(r => r.Specification),
+                        new FetchOptions { CredentialsProvider = _credentialsHandler }, null);
+                }
 
                 // Try to get local branch first
-                if (repo.Branches[branchName] != null)
+                if (repo.Branches[branchName] is {} literalBranch)
                 {
-                    branch = repo.Branches[branchName];
+                    if (literalBranch.IsRemote)
+                    {
+                        branch = repo.Branches.FirstOrDefault(x => x.TrackedBranch == literalBranch);
+                        if (branch == null)
+                        {
+                            var nameParts = literalBranch.FriendlyName.Split("/", 2);
+                            branch = repo.CreateBranch(nameParts.Length == 2 ? nameParts[1] : (nameParts[0] + "_local"), literalBranch.Tip);
+                            repo.Branches.Update(branch, b => b.TrackedBranch = literalBranch.CanonicalName);
+                        }
+                    }
+                    else
+                    {
+                        branch = literalBranch;
+                    }
                 }
+
                 // If local branch doesn't exist, try to create it from remote
-                else if (repo.Branches[$"origin/{branchName}"] != null)
+                else if (repo.Branches[$"{GetHeadRemote(repo, false).Name}/{branchName}"] is {} remoteBranch)
                 {
-                    var remoteBranch = repo.Branches[$"origin/{branchName}"];
                     branch = repo.CreateBranch(branchName, remoteBranch.Tip);
                     // Set up tracking
-                    repo.Branches.Update(branch,
+                    repo.Branches.Update(branch, 
                         b => b.TrackedBranch = remoteBranch.CanonicalName);
                 }
                 else
@@ -565,19 +665,10 @@ namespace PluginUpdater
                     
                 Commands.Checkout(repo, branch);
                 
-                // Reset the branch to match its remote tracking branch if it exists
-                var trackingBranch = branch.TrackedBranch;
-                if (trackingBranch != null)
-                {
-                    repo.Reset(ResetMode.Hard, trackingBranch.Tip);
-                }
-                
                 var plugin = _pluginInfo.GetValueOrDefault(pluginName);
                 if (plugin != null)
                 {
                     SetPluginInfo(plugin, repo);
-                    // Force an update of the plugin info in the dictionary to trigger UI refresh
-                    _pluginInfo[pluginName] = plugin;
                 }
             });
         }
