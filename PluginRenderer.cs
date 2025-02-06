@@ -270,6 +270,12 @@ namespace PluginUpdater
                 _settings.HasCheckedUpdates = false;
             }
 
+            bool wrapLogMessages = _settings.WrapLogMessages;
+            if (ImGui.Checkbox("Wrap log messages", ref wrapLogMessages))
+            {
+                _settings.WrapLogMessages = wrapLogMessages;
+            }
+
             if (ImGui.IsItemHovered())
             {
                 ImGui.SetTooltip("Automatically check for plugin updates when the game starts");
@@ -973,7 +979,13 @@ namespace PluginUpdater
             }
             catch (Exception ex)
             {
-                _consoleLog.LogError($"Error downloading plugin {pluginName}: {ex.Message}");
+                var additionalDetails = ex.Message switch
+                {
+                    var x when x.Contains("unknown certificate lookup failure", StringComparison.OrdinalIgnoreCase) =>
+                        $"This probably means your internet connection to the server the plugin is hosted on ({cloneUrl}) is being disrupted by something",
+                    _ => "",
+                };
+                _consoleLog.LogError($"Error downloading plugin {pluginName}: {ex.Message} {additionalDetails}");
             }
             finally
             {

@@ -61,14 +61,17 @@ namespace PluginUpdater
 
             var size = new Vector2(-1, -1);
             ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.2f, 0.2f, 0.2f, 1.0f));
-            if (ImGui.BeginChild("##consolelog", size, ImGuiChildFlags.Border, ImGuiWindowFlags.HorizontalScrollbar))
+            if (ImGui.BeginChild("##consolelog", size, ImGuiChildFlags.Border,
+                    PluginUpdater.Instance.Settings.WrapLogMessages
+                        ? ImGuiWindowFlags.None
+                        : ImGuiWindowFlags.HorizontalScrollbar))
             {
                 lock (_logLock)
                 {
                     foreach (var entry in _logEntries)
                     {
                         ImGui.PushStyleColor(ImGuiCol.Text, entry.Color);
-                        ImGui.Text($"[{entry.Timestamp:HH:mm:ss}] {entry.Message}");
+                        ImGui.TextWrapped($"[{entry.Timestamp:HH:mm:ss}] {entry.Message}");
                         ImGui.PopStyleColor();
                     }
                 }

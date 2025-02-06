@@ -16,6 +16,8 @@ public class PluginUpdaterSettings : ISettings
     public ToggleNode Enable { get; set; } = new ToggleNode(true);
     public bool CheckUpdatesOnStartup { get; set; }
     public bool AutoCheckUpdates { get; set; }
+    public bool WrapLogMessages { get; set; } = true;
+
     public int UpdateCheckIntervalMinutes { get; set; } = 60;
 
     [JsonIgnore]
