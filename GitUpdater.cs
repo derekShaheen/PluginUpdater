@@ -29,6 +29,7 @@ namespace PluginUpdater
         public int UncommittedChangeCount { get; set; }
         public List<string> AvailableBranches { get; set; } = new();
         public string CurrentBranch { get; set; }
+        public string Error { get; set; }
     }
 
     public class GitUpdater : IDisposable
@@ -268,6 +269,17 @@ namespace PluginUpdater
                 catch (Exception e)
                 {
                     DebugWindow.LogError($"Error processing {pluginInfo.Path}: {e}");
+                    pluginInfo.Error = e.Message;
+                    if (_pluginInfo.ContainsKey(pluginInfo.Name))
+                    {
+                        _pluginInfo[pluginInfo.Name] = pluginInfo;
+                    }
+                    else
+                    {
+                        using var repo = new Repository(pluginInfo.Path);
+                        SetPluginInfo(pluginInfo, repo);
+                        _pluginInfo.TryAdd(pluginInfo.Name, pluginInfo);
+                    }
                 }
                 finally
                 {

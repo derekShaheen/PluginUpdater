@@ -464,7 +464,17 @@ namespace PluginUpdater
 
         private static void RenderPluginName(PluginInfo pluginInfo)
         {
-            ImGui.Text(pluginInfo.Name);
+            if (!string.IsNullOrEmpty(pluginInfo.Error))
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1, 0, 0, 1));
+                ImGui.Text(pluginInfo.Name);
+                ImGui.PopStyleColor();
+            }
+            else
+            {
+                ImGui.Text(pluginInfo.Name);
+            }
+
             ImGui.TableNextColumn();
         }
 
@@ -509,6 +519,18 @@ namespace PluginUpdater
 
         private static void RenderCommitInfo(PluginInfo pluginInfo)
         {
+            if (!string.IsNullOrEmpty(pluginInfo.Error))
+            {
+                ImGui.TextColored(new System.Numerics.Vector4(1, 0, 0, 1), "Update failed");
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip(pluginInfo.Error);
+                }
+
+                ImGui.TableNextColumn();
+                return;
+            }
+
             string text;
             if (string.IsNullOrEmpty(pluginInfo.LatestCommit))
             {
