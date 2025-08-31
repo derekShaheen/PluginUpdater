@@ -499,8 +499,15 @@ namespace PluginUpdater
                             _consoleLog.LogInfo($"Switching {pluginInfo.Name} to branch {branch}...");
                             _ = Task.Run(async () =>
                             {
-                                await _updater.ChangeBranchAsync(pluginInfo.Name, branch);
-                                _consoleLog.LogSuccess($"Successfully switched {pluginInfo.Name} to branch {branch}");
+                                try
+                                {
+                                    await _updater.ChangeBranchAsync(pluginInfo, branch);
+                                    _consoleLog.LogSuccess($"Successfully switched {pluginInfo.Name} to branch {branch}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    _consoleLog.LogError($"Switch failed: {ex}");
+                                }
                             });
                         }
                     }

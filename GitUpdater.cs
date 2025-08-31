@@ -47,7 +47,8 @@ namespace PluginUpdater
             Directory.GetDirectories(_pluginFolder).Select(x =>
             {
                 var resolvedPath = PluginManager.ResolvePluginDirectory(x);
-                if (Directory.Exists(Path.Join(resolvedPath, ".git")))
+                var gitPath = Path.Join(resolvedPath, ".git");
+                if (Directory.Exists(gitPath) || File.Exists(gitPath))
                 {
                     return CreatePluginInfo(Path.GetFileName(x), resolvedPath);
                 }
@@ -59,7 +60,8 @@ namespace PluginUpdater
             Directory.GetDirectories(_pluginFolder).Select(x =>
             {
                 var resolvedPath = PluginManager.ResolvePluginDirectory(x);
-                if (!Directory.Exists(Path.Join(resolvedPath, ".git")))
+                var gitPath = Path.Join(resolvedPath, ".git");
+                if (!Directory.Exists(gitPath) && !File.Exists(gitPath))
                 {
                     return CreatePluginInfo(Path.GetFileName(x), resolvedPath);
                 }
@@ -192,11 +194,7 @@ namespace PluginUpdater
                 .ToList();
 
             var trackedBranches = localBranches
-                .Select(x => x.RemoteName == null ||
-                             x.RemoteName.EndsWith(".git", StringComparison.OrdinalIgnoreCase) ||
-                             repository.Network.Remotes[x.RemoteName] == null
-                    ? null
-                    : x.TrackedBranch)
+                .Select(x => GetTrackedBranchSafe(repository, x))
                 .Where(x => x != null)
                 .ToHashSet();
 
@@ -215,6 +213,15 @@ namespace PluginUpdater
                 .ToList();
             
             plugin.CurrentBranch = repository.Head.FriendlyName;
+        }
+
+        private static Branch GetTrackedBranchSafe(Repository repository, Branch x)
+        {
+            return x.RemoteName == null ||
+                   x.RemoteName.EndsWith(".git", StringComparison.OrdinalIgnoreCase) ||
+                   repository.Network.Remotes[x.RemoteName] == null
+                ? null
+                : x.TrackedBranch;
         }
 
         private async Task UpdateGitInfoInternalAsync(CancellationToken cancellationToken)
@@ -628,9 +635,9 @@ namespace PluginUpdater
             };
         };
 
-        public async Task ChangeBranchAsync(string pluginName, string branchName)
+        public async Task ChangeBranchAsync(PluginInfo plugin, string branchName)
         {
-            var pluginPath = Path.Combine(_pluginFolder, pluginName);
+            var pluginPath = plugin.Path;
             
             await Task.Run(() =>
             {
@@ -648,11 +655,17 @@ namespace PluginUpdater
                 {
                     if (literalBranch.IsRemote)
                     {
-                        branch = repo.Branches.FirstOrDefault(x => x.TrackedBranch == literalBranch);
+                        branch = repo.Branches.FirstOrDefault(x => GetTrackedBranchSafe(repo, x) == literalBranch);
                         if (branch == null)
                         {
                             var nameParts = literalBranch.FriendlyName.Split("/", 2);
-                            branch = repo.CreateBranch(nameParts.Length == 2 ? nameParts[1] : (nameParts[0] + "_local"), literalBranch.Tip);
+                            var branchNameCandidate = nameParts.Length == 2 ? nameParts[1] : (nameParts[0] + "_local");
+                            if (repo.Branches[branchNameCandidate] != null)
+                            {
+                                branchNameCandidate = literalBranch.FriendlyName.Replace('/', '_');
+                            }
+
+                            branch = repo.CreateBranch(branchNameCandidate, literalBranch.Tip);
                             repo.Branches.Update(branch, b => b.TrackedBranch = literalBranch.CanonicalName);
                         }
                     }
@@ -663,25 +676,21 @@ namespace PluginUpdater
                 }
 
                 // If local branch doesn't exist, try to create it from remote
-                else if (repo.Branches[$"{GetHeadRemote(repo, false).Name}/{branchName}"] is {} remoteBranch)
+                else if (repo.Branches[$"{GetHeadRemote(repo, false).Name}/{branchName}"] is { } remoteBranch)
                 {
                     branch = repo.CreateBranch(branchName, remoteBranch.Tip);
                     // Set up tracking
-                    repo.Branches.Update(branch, 
+                    repo.Branches.Update(branch,
                         b => b.TrackedBranch = remoteBranch.CanonicalName);
                 }
                 else
                 {
                     throw new Exception($"Branch {branchName} not found locally or remotely");
                 }
-                    
+
                 Commands.Checkout(repo, branch);
                 
-                var plugin = _pluginInfo.GetValueOrDefault(pluginName);
-                if (plugin != null)
-                {
-                    SetPluginInfo(plugin, repo);
-                }
+                SetPluginInfo(plugin, repo);
             });
         }
     }
