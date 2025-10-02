@@ -8,6 +8,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using ImGuiNET;
 
@@ -29,10 +30,10 @@ namespace PluginUpdater
         private string _repoUrl = string.Empty;
         private bool _isCloning;
         private bool _isDownloadingRelease;
-        private readonly Dictionary<string, bool> _releaseReinstalling = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, string> _latestReleaseChecksums = new(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _releaseUpdatesAvailable = new(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _missingChecksumLogged = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, bool> _releaseReinstalling = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, string> _latestReleaseChecksums = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _releaseUpdatesAvailable = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _missingChecksumLogged = new(StringComparer.OrdinalIgnoreCase);
         private bool _isCheckingReleaseUpdates;
         private DateTime _lastPeriodicCheckAttempt = DateTime.MinValue;
         private string _pluginToDelete;
@@ -732,7 +733,8 @@ namespace PluginUpdater
             if (pluginInfo.IsManualInstall)
             {
                 var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
-                var hasSource = releaseSources != null && releaseSources.TryGetValue(pluginInfo.Name, out var releaseUrl) && !string.IsNullOrWhiteSpace(releaseUrl);
+                string releaseUrl = null;
+                var hasSource = releaseSources != null && releaseSources.TryGetValue(pluginInfo.Name, out releaseUrl) && !string.IsNullOrWhiteSpace(releaseUrl);
                 bool isReinstalling = _releaseReinstalling.TryGetValue(pluginInfo.Name, out bool reinstalling) && reinstalling;
 
                 if (hasSource)
@@ -1346,6 +1348,35 @@ namespace PluginUpdater
 
         private static void DeleteDirectory(string directory)
         {
+            const int maxAttempts = 5;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                try
+                {
+                    NormalizeDirectoryAttributes(directory);
+                    Directory.Delete(directory, true);
+                    return;
+                }
+                catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && attempt < maxAttempts - 1)
+                {
+                    PluginLogger.Warn($"Failed to delete {directory} on attempt {attempt + 1}: {ex.Message}. Retrying after releasing file handles.");
+                    PluginLifecycleHelper.EnsureAssembliesReleased();
+                    Thread.Sleep(200);
+                }
+            }
+
+            NormalizeDirectoryAttributes(directory);
+            Directory.Delete(directory, true);
+        }
+
+        private static void NormalizeDirectoryAttributes(string directory)
+        {
+            if (!Directory.Exists(directory))
+            {
+                return;
+            }
+
             foreach (var file in Directory.GetFiles(directory, "*", SearchOption.AllDirectories))
             {
                 File.SetAttributes(file, FileAttributes.Normal);
@@ -1355,8 +1386,6 @@ namespace PluginUpdater
             {
                 File.SetAttributes(dir, FileAttributes.Normal);
             }
-
-            Directory.Delete(directory, true);
         }
 
         private static string SanitizePluginName(string pluginName)

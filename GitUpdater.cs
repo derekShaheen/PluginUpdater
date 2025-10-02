@@ -543,9 +543,7 @@ namespace PluginUpdater
             try
             {
                 PluginLifecycleHelper.TryUnloadPlugin(pluginName);
-
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
+                PluginLifecycleHelper.EnsureAssembliesReleased();
 
                 foreach (var file in Directory.GetFiles(pluginPath, "*.*", SearchOption.AllDirectories))
                     File.SetAttributes(file, FileAttributes.Normal);

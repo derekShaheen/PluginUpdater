@@ -18,10 +18,22 @@ internal static class PluginLifecycleHelper
 
         try
         {
+            var container = PManager.Plugins.FirstOrDefault(
+                plugin => plugin != null &&
+                          plugin.Name.Equals(pluginName, StringComparison.OrdinalIgnoreCase));
+
+            if (container != null)
+            {
+                container.Metadata.Enable = false;
+            }
+
             if (!PManager.UnloadPlugin(pluginName))
             {
                 return false;
             }
+
+            PManager.SavePluginMetadata();
+            EnsureAssembliesReleased();
 
             var successMessage = $"Unloaded plugin {pluginName} before file operations.";
             consoleLog?.LogInfo(successMessage);
@@ -86,6 +98,20 @@ internal static class PluginLifecycleHelper
             consoleLog?.LogError(message);
             PluginLogger.Error(message);
             return false;
+        }
+    }
+
+    public static void EnsureAssembliesReleased()
+    {
+        try
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+        }
+        catch (Exception ex)
+        {
+            PluginLogger.Warn($"Failed to force GC while releasing plugin assemblies: {ex.Message}");
         }
     }
 }
