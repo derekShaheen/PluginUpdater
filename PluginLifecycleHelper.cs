@@ -120,7 +120,7 @@ internal static class PluginLifecycleHelper
 
             container.Metadata.Enable = true;
             PManager.SavePluginMetadata();
-            container.Plugin.OnEnable(Core.Process.Address != IntPtr.Zero);
+            container.Plugin.OnEnable(Core.States.Address != IntPtr.Zero);
 
             var successMessage = $"Loaded plugin {plugin.Name} after file operations.";
             consoleLog?.LogInfo(successMessage);
