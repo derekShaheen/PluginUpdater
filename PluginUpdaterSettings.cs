@@ -23,6 +23,9 @@ public class PluginUpdaterSettings
     public Dictionary<string, string> ReleaseSources { get; set; }
         = new(StringComparer.OrdinalIgnoreCase);
 
+    public Dictionary<string, string> ReleaseChecksums { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
     [JsonIgnore]
     public DateTime LastUpdateCheck { get; set; } = DateTime.Now;
 

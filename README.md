@@ -1,6 +1,6 @@
 **Usage**
 
-The "Add" tab now supports Git repositories as well as GitHub release links (for example `https://github.com/derekShaheen/Aura-Tracker-Gamehelper2/releases` or a direct release asset URL). Release archives are automatically extracted into the `Plugins` folder and remembered so they can be re-downloaded later from the Manage tab.
+The "Add" tab now supports Git repositories as well as GitHub release links (for example `https://github.com/derekShaheen/Aura-Tracker-Gamehelper2/releases` or a direct release asset URL). Release archives are automatically extracted into the `Plugins` folder and remembered so they can be re-downloaded later from the Manage tab. When a release is installed the updater stores the archive checksum so that future update checks can redownload the latest release and alert you when a new checksum is published.
 
 **Preview**
 

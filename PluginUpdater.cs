@@ -195,5 +195,9 @@ public sealed class PluginUpdater : PCore<PluginUpdaterSettings>
         Settings.ReleaseSources = Settings.ReleaseSources != null
             ? new Dictionary<string, string>(Settings.ReleaseSources, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        Settings.ReleaseChecksums = Settings.ReleaseChecksums != null
+            ? new Dictionary<string, string>(Settings.ReleaseChecksums, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
 }

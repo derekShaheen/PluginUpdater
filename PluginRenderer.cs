@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading.Tasks;
 using ImGuiNET;
@@ -29,6 +30,10 @@ namespace PluginUpdater
         private bool _isCloning;
         private bool _isDownloadingRelease;
         private readonly Dictionary<string, bool> _releaseReinstalling = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _latestReleaseChecksums = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _releaseUpdatesAvailable = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _missingChecksumLogged = new(StringComparer.OrdinalIgnoreCase);
+        private bool _isCheckingReleaseUpdates;
         private DateTime _lastPeriodicCheckAttempt = DateTime.MinValue;
         private string _pluginToDelete;
 
@@ -80,6 +85,107 @@ namespace PluginUpdater
             }
         }
 
+        private async Task CheckReleaseUpdatesAsync()
+        {
+            if (_isCheckingReleaseUpdates)
+            {
+                return;
+            }
+
+            var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+            if (releaseSources == null || releaseSources.Count == 0)
+            {
+                _releaseUpdatesAvailable.Clear();
+                _latestReleaseChecksums.Clear();
+                _missingChecksumLogged.Clear();
+                return;
+            }
+
+            _isCheckingReleaseUpdates = true;
+
+            try
+            {
+                var releaseChecksums = PluginUpdater.Instance?.Settings.ReleaseChecksums;
+
+                var trackedPlugins = new HashSet<string>(releaseSources.Keys, StringComparer.OrdinalIgnoreCase);
+                _releaseUpdatesAvailable.RemoveWhere(name => !trackedPlugins.Contains(name));
+
+                foreach (var key in _latestReleaseChecksums.Keys.Where(key => !trackedPlugins.Contains(key)).ToList())
+                {
+                    _latestReleaseChecksums.Remove(key);
+                }
+
+                _missingChecksumLogged.RemoveWhere(name => !trackedPlugins.Contains(name));
+
+                int processed = 0;
+                _totalProgress = releaseSources.Count;
+                _currentProgress = 0;
+
+                foreach (var kvp in releaseSources.ToArray())
+                {
+                    var pluginName = kvp.Key;
+                    var releaseUrl = kvp.Value;
+
+                    if (string.IsNullOrWhiteSpace(releaseUrl))
+                    {
+                        _currentProgress = ++processed;
+                        continue;
+                    }
+
+                    if (_releaseReinstalling.TryGetValue(pluginName, out bool reinstalling) && reinstalling)
+                    {
+                        _currentProgress = ++processed;
+                        continue;
+                    }
+
+                    try
+                    {
+                        var releaseInfo = await ResolveReleaseAsync(releaseUrl);
+                        var checksum = await DownloadReleaseChecksumAsync(releaseInfo.DownloadUrl);
+                        _latestReleaseChecksums[pluginName] = checksum;
+
+                        if (releaseChecksums != null &&
+                            releaseChecksums.TryGetValue(pluginName, out var storedChecksum) &&
+                            !string.IsNullOrWhiteSpace(storedChecksum))
+                        {
+                            if (string.Equals(storedChecksum, checksum, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _releaseUpdatesAvailable.Remove(pluginName);
+                            }
+                            else
+                            {
+                                _releaseUpdatesAvailable.Add(pluginName);
+                            }
+                        }
+                        else
+                        {
+                            if (_missingChecksumLogged.Add(pluginName))
+                            {
+                                _consoleLog.LogWarning($"No checksum recorded for {pluginName}. Redownload to start release tracking.");
+                            }
+
+                            _releaseUpdatesAvailable.Add(pluginName);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        PluginLogger.Warn($"Failed to check release for {pluginName}: {ex.Message}");
+                        _consoleLog.LogWarning($"Failed to check release for {pluginName}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        _currentProgress = ++processed;
+                    }
+                }
+            }
+            finally
+            {
+                _isCheckingReleaseUpdates = false;
+                _currentProgress = 0;
+                _totalProgress = 0;
+            }
+        }
+
         private async Task UpdateGitInfoAsync()
         {
             if (_isUpdating) return;
@@ -88,6 +194,7 @@ namespace PluginUpdater
             {
                 _isUpdating = true;
                 await _updater.UpdateGitInfoAsync();
+                await CheckReleaseUpdatesAsync();
 
                 var plugins = _updater.GetPluginInfo();
                 int updateCount = plugins.Count(p => p.CurrentCommit != p.LatestCommit);
@@ -95,6 +202,12 @@ namespace PluginUpdater
                 {
                     var updateLabel = updateCount == 1 ? "update" : "updates";
                     _consoleLog.LogInfo($"There {(updateCount == 1 ? "is" : "are")} {updateCount} plugin {updateLabel} pending.");
+                }
+
+                if (_releaseUpdatesAvailable.Count > 0)
+                {
+                    var releaseLabel = _releaseUpdatesAvailable.Count == 1 ? "release update" : "release updates";
+                    _consoleLog.LogInfo($"There {(_releaseUpdatesAvailable.Count == 1 ? "is" : "are")} {_releaseUpdatesAvailable.Count} {releaseLabel} available.");
                 }
             }
             catch (Exception e)
@@ -357,6 +470,15 @@ namespace PluginUpdater
 
             ImGui.InputTextWithHint("##filter", "Filter", ref _pluginNameFilter, 200);
 
+            if (_releaseUpdatesAvailable.Count > 0)
+            {
+                ImGui.SameLine();
+                var releaseText = _releaseUpdatesAvailable.Count == 1
+                    ? "1 release update available"
+                    : $"{_releaseUpdatesAvailable.Count} release updates available";
+                ImGui.TextColored(new System.Numerics.Vector4(1f, 0.8f, 0.2f, 1f), releaseText);
+            }
+
             if(_isUpdating && _totalProgress > 0)
             {
                 float progress = (float)_currentProgress / _totalProgress;
@@ -510,6 +632,7 @@ namespace PluginUpdater
             if (pluginInfo.IsManualInstall)
             {
                 var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                var releaseChecksums = PluginUpdater.Instance?.Settings.ReleaseChecksums;
                 if (releaseSources != null && releaseSources.TryGetValue(pluginInfo.Name, out var source))
                 {
                     ImGui.TextWrapped($"Installed from release: {source}");
@@ -517,6 +640,27 @@ namespace PluginUpdater
                 else
                 {
                     ImGui.TextWrapped("Installed from release archive. Use the Add tab to redownload when updates are available.");
+                }
+
+                if (_releaseUpdatesAvailable.Contains(pluginInfo.Name))
+                {
+                    ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1f, 0.6f, 0f, 1f));
+                    ImGui.TextWrapped("New release available. Use Redownload to install the latest files.");
+                    ImGui.PopStyleColor();
+
+                    if (releaseChecksums != null && releaseChecksums.TryGetValue(pluginInfo.Name, out var storedChecksum) && !string.IsNullOrWhiteSpace(storedChecksum))
+                    {
+                        ImGui.Text($"Installed checksum: {ShortenHash(storedChecksum)}");
+                    }
+
+                    if (_latestReleaseChecksums.TryGetValue(pluginInfo.Name, out var latestChecksum))
+                    {
+                        ImGui.Text($"Latest checksum: {ShortenHash(latestChecksum)}");
+                    }
+                }
+                else if (releaseChecksums != null && releaseChecksums.TryGetValue(pluginInfo.Name, out var installedChecksum) && !string.IsNullOrWhiteSpace(installedChecksum))
+                {
+                    ImGui.Text($"Installed checksum: {ShortenHash(installedChecksum)}");
                 }
 
                 ImGui.TableNextColumn();
@@ -599,9 +743,28 @@ namespace PluginUpdater
                         ImGui.Button($"Redownloading...##{pluginInfo.Name}");
                         ImGui.EndDisabled();
                     }
-                    else if (ImGui.Button($"Redownload##{pluginInfo.Name}"))
+                    else
                     {
-                        _ = DownloadReleaseAsync(releaseUrl, pluginInfo.Name);
+                        bool hasUpdate = _releaseUpdatesAvailable.Contains(pluginInfo.Name);
+
+                        if (hasUpdate)
+                        {
+                            ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0f, 0.5f, 0f, 1.0f));
+                            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0f, 0.7f, 0f, 1.0f));
+                            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0f, 0.3f, 0f, 1.0f));
+                        }
+
+                        var buttonLabel = hasUpdate ? $"Update##{pluginInfo.Name}" : $"Redownload##{pluginInfo.Name}";
+
+                        if (ImGui.Button(buttonLabel))
+                        {
+                            _ = DownloadReleaseAsync(releaseUrl, pluginInfo.Name);
+                        }
+
+                        if (hasUpdate)
+                        {
+                            ImGui.PopStyleColor(3);
+                        }
                     }
 
                     if (ImGui.IsItemHovered())
@@ -850,6 +1013,7 @@ namespace PluginUpdater
                 _consoleLog.LogInfo($"Downloading release from {releaseInfo.NormalizedUrl}...");
 
                 await DownloadFileAsync(releaseInfo.DownloadUrl, tempZip);
+                var releaseChecksum = ComputeFileChecksum(tempZip);
 
                 ZipFile.ExtractToDirectory(tempZip, tempDirectory, true);
 
@@ -880,11 +1044,29 @@ namespace PluginUpdater
                 }
 
                 var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                var releaseChecksums = PluginUpdater.Instance?.Settings.ReleaseChecksums;
+                bool settingsChanged = false;
+
                 if (releaseSources != null)
                 {
                     releaseSources[pluginName] = releaseInfo.NormalizedUrl;
+                    settingsChanged = true;
+                }
+
+                if (releaseChecksums != null)
+                {
+                    releaseChecksums[pluginName] = releaseChecksum;
+                    settingsChanged = true;
+                }
+
+                if (settingsChanged)
+                {
                     PluginUpdater.Instance?.SaveSettings();
                 }
+
+                _latestReleaseChecksums[pluginName] = releaseChecksum;
+                _releaseUpdatesAvailable.Remove(pluginName);
+                _missingChecksumLogged.Remove(pluginName);
 
                 _updater.UpdateLocal();
             }
@@ -929,6 +1111,31 @@ namespace PluginUpdater
             }
         }
 
+        private static async Task<string> DownloadReleaseChecksumAsync(string downloadUrl)
+        {
+            string tempFile = Path.Combine(Path.GetTempPath(), $"PluginUpdater_checksum_{Guid.NewGuid():N}.zip");
+
+            try
+            {
+                await DownloadFileAsync(downloadUrl, tempFile);
+                return ComputeFileChecksum(tempFile);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try
+                    {
+                        File.Delete(tempFile);
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
+                }
+            }
+        }
+
         private static async Task DownloadFileAsync(string url, string destinationPath)
         {
             using var client = CreateHttpClient();
@@ -938,6 +1145,24 @@ namespace PluginUpdater
             await using var stream = await response.Content.ReadAsStreamAsync();
             await using var fileStream = File.Create(destinationPath);
             await stream.CopyToAsync(fileStream);
+        }
+
+        private static string ComputeFileChecksum(string filePath)
+        {
+            using var stream = File.OpenRead(filePath);
+            using var sha = SHA256.Create();
+            var hash = sha.ComputeHash(stream);
+            return Convert.ToHexString(hash);
+        }
+
+        private static string ShortenHash(string hash)
+        {
+            if (string.IsNullOrWhiteSpace(hash))
+            {
+                return "unknown";
+            }
+
+            return hash.Length > 8 ? hash[..8] : hash;
         }
 
         private async Task<ReleaseDownloadInfo> ResolveReleaseAsync(string releaseUrl)
@@ -1168,10 +1393,27 @@ namespace PluginUpdater
                     _consoleLog.LogSuccess($"Successfully deleted plugin: {_pluginToDelete}");
 
                     var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                    var releaseChecksums = PluginUpdater.Instance?.Settings.ReleaseChecksums;
+                    bool settingsChanged = false;
+
                     if (releaseSources != null && releaseSources.Remove(_pluginToDelete))
+                    {
+                        settingsChanged = true;
+                    }
+
+                    if (releaseChecksums != null && releaseChecksums.Remove(_pluginToDelete))
+                    {
+                        settingsChanged = true;
+                    }
+
+                    if (settingsChanged)
                     {
                         PluginUpdater.Instance?.SaveSettings();
                     }
+
+                    _releaseUpdatesAvailable.Remove(_pluginToDelete);
+                    _latestReleaseChecksums.Remove(_pluginToDelete);
+                    _missingChecksumLogged.Remove(_pluginToDelete);
 
                     _updater.UpdateLocal();
                 }
