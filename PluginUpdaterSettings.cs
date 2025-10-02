@@ -1,10 +1,11 @@
 using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
+using GameHelper.Plugin;
 
 namespace PluginUpdater;
 
-public class PluginUpdaterSettings
+public class PluginUpdaterSettings : IPSettings
 {
     public bool Enable { get; set; } = true;
 

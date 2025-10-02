@@ -6,7 +6,6 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 using LibGit2Sharp;
 using LibGit2Sharp.Handlers;
 
@@ -109,21 +108,16 @@ namespace PluginUpdater
         {
             if (_updateTask != null && !_updateTask.IsCompleted)
             {
-                var result = MessageBox.Show(
-                    "Update in progress, do you want to restart?",
-                    "Update in progress",
-                    MessageBoxButtons.YesNo);
-
-                if (result == DialogResult.No)
-                    return;
-
+                PluginLogger.Info("An update is already running; cancelling before starting a new one.");
                 _updateCts?.Cancel();
 
                 try
                 {
                     await Task.WhenAny(_updateTask, Task.Delay(5000));
                 }
-                catch (OperationCanceledException) { }
+                catch (OperationCanceledException)
+                {
+                }
                 catch (Exception ex)
                 {
                     PluginLogger.Error($"Error during task cancellation: {ex.Message}");
