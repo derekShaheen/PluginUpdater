@@ -1036,7 +1036,14 @@ namespace PluginUpdater
                 Directory.CreateDirectory(targetDirectory);
                 CopyDirectoryContents(sourceDirectory, targetDirectory);
 
-                _consoleLog.LogSuccess($"Installed release for {pluginName}");
+                if (!PluginLifecycleHelper.TryLoadPlugin(pluginName, targetDirectory, _consoleLog))
+                {
+                    _consoleLog.LogWarning($"Installed plugin {pluginName} but could not load it automatically. Enable it from settings if needed.");
+                }
+                else
+                {
+                    _consoleLog.LogSuccess($"Installed release for {pluginName}");
+                }
 
                 if (!isReinstall)
                 {
