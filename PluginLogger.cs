@@ -9,6 +9,11 @@ internal static class PluginLogger
         Console.WriteLine($"[PluginUpdater][INFO] {message}");
     }
 
+    public static void Warn(string message)
+    {
+        Console.WriteLine($"[PluginUpdater][WARN] {message}");
+    }
+
     public static void Error(string message)
     {
         Console.WriteLine($"[PluginUpdater][ERROR] {message}");
