@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.Loader;
@@ -96,9 +95,8 @@ internal static class PluginLifecycleHelper
                 return false;
             }
 
-            var knownNames = new HashSet<string>(PManager.Plugins.Select(p => p.Name), StringComparer.OrdinalIgnoreCase);
-
-            if (!PManager.LoadPlugin(pluginName))
+            var plugin = PManager.LoadPlugin(directoryInfo);
+            if (plugin == null)
             {
                 var message = $"GameHelper failed to load plugin from {directoryInfo.FullName}.";
                 consoleLog?.LogWarning(message);
@@ -106,20 +104,25 @@ internal static class PluginLifecycleHelper
                 return false;
             }
 
+            PManager.LoadPluginMetadata(new[] { plugin });
+
             var container = PManager.Plugins.FirstOrDefault(
-                plugin => plugin != null && !knownNames.Contains(plugin.Name));
+                candidate => candidate != null &&
+                              candidate.Name.Equals(plugin.Name, StringComparison.OrdinalIgnoreCase));
 
-            container ??= PManager.Plugins.FirstOrDefault(
-                plugin => plugin != null &&
-                          plugin.Name.Equals(pluginName, StringComparison.OrdinalIgnoreCase));
-
-            if (container != null)
+            if (container == null)
             {
-                container.Metadata.Enable = true;
-                PManager.SavePluginMetadata();
+                var message = $"Loaded assembly for {plugin.Name} but plugin container was not registered.";
+                consoleLog?.LogWarning(message);
+                PluginLogger.Warn(message);
+                return false;
             }
 
-            var successMessage = $"Loaded plugin {pluginName} after file operations.";
+            container.Metadata.Enable = true;
+            PManager.SavePluginMetadata();
+            container.Plugin.OnEnable(Core.Process.Address != IntPtr.Zero);
+
+            var successMessage = $"Loaded plugin {plugin.Name} after file operations.";
             consoleLog?.LogInfo(successMessage);
             PluginLogger.Info(successMessage);
             return true;

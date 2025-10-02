@@ -199,5 +199,11 @@ public sealed class PluginUpdater : PCore<PluginUpdaterSettings>
         Settings.ReleaseChecksums = Settings.ReleaseChecksums != null
             ? new Dictionary<string, string>(Settings.ReleaseChecksums, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        Settings.ReleaseInstallDirectories = Settings.ReleaseInstallDirectories != null
+            ? new Dictionary<string, string>(Settings.ReleaseInstallDirectories, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        Settings.PendingDeletionDirectories ??= new List<string>();
     }
 }

@@ -27,6 +27,12 @@ public class PluginUpdaterSettings : IPSettings
     public Dictionary<string, string> ReleaseChecksums { get; set; }
         = new(StringComparer.OrdinalIgnoreCase);
 
+    public Dictionary<string, string> ReleaseInstallDirectories { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    public List<string> PendingDeletionDirectories { get; set; }
+        = new();
+
     [JsonIgnore]
     public DateTime LastUpdateCheck { get; set; } = DateTime.Now;
 

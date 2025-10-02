@@ -50,6 +50,8 @@ namespace PluginUpdater
 
         public void Startup()
         {
+            CleanupPendingDirectories();
+
             _updater = new GitUpdater(_pluginRootPath);
             _updater.ProgressChanged += (current, total) =>
             {
@@ -1019,16 +1021,31 @@ namespace PluginUpdater
 
                 ZipFile.ExtractToDirectory(tempZip, tempDirectory, true);
 
-                var (sourceDirectory, pluginName) = DetermineExtractionRoot(tempDirectory, existingPluginName, releaseInfo.PluginNameFallback);
-                pluginName = SanitizePluginName(pluginName);
+                var (sourceDirectory, extractedName) = DetermineExtractionRoot(tempDirectory, existingPluginName, releaseInfo.PluginNameFallback);
+                var pluginName = SanitizePluginName(extractedName);
 
-                var targetDirectory = Path.Combine(_pluginRootPath, pluginName);
+                var installDirectories = PluginUpdater.Instance?.Settings.ReleaseInstallDirectories;
+                var targetDirectoryName = ResolveTargetDirectoryName(pluginName, installDirectories);
+                var targetDirectory = Path.Combine(_pluginRootPath, targetDirectoryName);
+                var reusedExistingDirectory = false;
 
                 if (Directory.Exists(targetDirectory))
                 {
                     PluginLifecycleHelper.TryUnloadPlugin(pluginName, _consoleLog);
-                    DeleteDirectory(targetDirectory);
-                    _consoleLog.LogInfo($"Replacing existing plugin {pluginName} with the downloaded release");
+
+                    if (!TryDeleteDirectory(targetDirectory, out var failure))
+                    {
+                        _consoleLog.LogWarning($"Could not replace existing plugin files for {pluginName}: {failure.Message}. Installing into a new folder instead.");
+                        ScheduleDirectoryForCleanup(targetDirectory);
+                        targetDirectoryName = GenerateUniqueDirectoryName(pluginName);
+                        targetDirectory = Path.Combine(_pluginRootPath, targetDirectoryName);
+                    }
+                    else
+                    {
+                        reusedExistingDirectory = true;
+                        ClearPendingCleanupEntry(targetDirectory);
+                        _consoleLog.LogInfo($"Replacing existing plugin {pluginName} with the downloaded release");
+                    }
                 }
                 else
                 {
@@ -1066,6 +1083,16 @@ namespace PluginUpdater
                 {
                     releaseChecksums[pluginName] = releaseChecksum;
                     settingsChanged = true;
+                }
+
+                if (installDirectories != null)
+                {
+                    if (!installDirectories.TryGetValue(pluginName, out var recordedName) ||
+                        !string.Equals(recordedName, targetDirectoryName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        installDirectories[pluginName] = targetDirectoryName;
+                        settingsChanged = true;
+                    }
                 }
 
                 if (settingsChanged)
@@ -1346,8 +1373,15 @@ namespace PluginUpdater
             }
         }
 
-        private static void DeleteDirectory(string directory)
+        private static bool TryDeleteDirectory(string directory, out Exception failure)
         {
+            failure = null;
+
+            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            {
+                return true;
+            }
+
             const int maxAttempts = 5;
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
@@ -1356,18 +1390,29 @@ namespace PluginUpdater
                 {
                     NormalizeDirectoryAttributes(directory);
                     Directory.Delete(directory, true);
-                    return;
+                    return true;
                 }
-                catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && attempt < maxAttempts - 1)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
+                    failure = ex;
                     PluginLogger.Warn($"Failed to delete {directory} on attempt {attempt + 1}: {ex.Message}. Retrying after releasing file handles.");
                     PluginLifecycleHelper.EnsureAssembliesReleased();
                     Thread.Sleep(200);
                 }
             }
 
-            NormalizeDirectoryAttributes(directory);
-            Directory.Delete(directory, true);
+            try
+            {
+                NormalizeDirectoryAttributes(directory);
+                Directory.Delete(directory, true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+                PluginLogger.Warn($"Final attempt to delete {directory} failed: {ex.Message}");
+                return false;
+            }
         }
 
         private static void NormalizeDirectoryAttributes(string directory)
@@ -1401,6 +1446,138 @@ namespace PluginUpdater
             return string.IsNullOrWhiteSpace(sanitized) ? $"Plugin_{Guid.NewGuid():N}" : sanitized;
         }
 
+        private string ResolveTargetDirectoryName(string pluginName, Dictionary<string, string> installDirectories)
+        {
+            if (installDirectories != null &&
+                installDirectories.TryGetValue(pluginName, out var directoryName) &&
+                !string.IsNullOrWhiteSpace(directoryName))
+            {
+                return directoryName;
+            }
+
+            return SanitizePluginName(pluginName);
+        }
+
+        private static string GenerateUniqueDirectoryName(string pluginName)
+        {
+            var sanitized = SanitizePluginName(pluginName);
+            return $"{sanitized}_{DateTime.UtcNow:yyyyMMddHHmmss}";
+        }
+
+        private void ScheduleDirectoryForCleanup(string directory)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+                {
+                    return;
+                }
+
+                var dirInfo = new DirectoryInfo(directory);
+                dirInfo.Attributes |= FileAttributes.Hidden;
+
+                var pending = PluginUpdater.Instance?.Settings.PendingDeletionDirectories;
+                if (pending == null)
+                {
+                    return;
+                }
+
+                var relative = GetRelativePluginPath(directory);
+                if (pending.Any(entry => string.Equals(entry, relative, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return;
+                }
+
+                pending.Add(relative);
+                PluginUpdater.Instance?.SaveSettings();
+            }
+            catch (Exception ex)
+            {
+                PluginLogger.Warn($"Failed to schedule cleanup for {directory}: {ex.Message}");
+            }
+        }
+
+        private void ClearPendingCleanupEntry(string directory)
+        {
+            try
+            {
+                var pending = PluginUpdater.Instance?.Settings.PendingDeletionDirectories;
+                if (pending == null || pending.Count == 0)
+                {
+                    return;
+                }
+
+                var relative = GetRelativePluginPath(directory);
+                var removed = pending.RemoveAll(entry => string.Equals(entry, relative, StringComparison.OrdinalIgnoreCase));
+
+                if (removed > 0)
+                {
+                    PluginUpdater.Instance?.SaveSettings();
+                }
+            }
+            catch (Exception ex)
+            {
+                PluginLogger.Warn($"Failed to clear pending cleanup entry for {directory}: {ex.Message}");
+            }
+        }
+
+        private void CleanupPendingDirectories()
+        {
+            var pending = PluginUpdater.Instance?.Settings.PendingDeletionDirectories;
+            if (pending == null || pending.Count == 0)
+            {
+                return;
+            }
+
+            var directories = pending.ToList();
+            var removedAny = false;
+
+            foreach (var entry in directories)
+            {
+                var fullPath = Path.IsPathRooted(entry) ? entry : Path.Combine(_pluginRootPath, entry);
+
+                if (!Directory.Exists(fullPath))
+                {
+                    pending.Remove(entry);
+                    removedAny = true;
+                    continue;
+                }
+
+                if (TryDeleteDirectory(fullPath, out var failure))
+                {
+                    pending.Remove(entry);
+                    removedAny = true;
+                }
+                else if (failure != null)
+                {
+                    PluginLogger.Warn($"Deferred cleanup for {fullPath} failed: {failure.Message}");
+                }
+            }
+
+            if (removedAny)
+            {
+                PluginUpdater.Instance?.SaveSettings();
+            }
+        }
+
+        private string GetRelativePluginPath(string directory)
+        {
+            try
+            {
+                var relative = Path.GetRelativePath(_pluginRootPath, directory);
+                if (!relative.StartsWith("..", StringComparison.Ordinal))
+                {
+                    return relative;
+                }
+            }
+            catch
+            {
+                // fall back to absolute path
+            }
+
+            return directory;
+        }
+
         private void RenderDeleteConfirmationModal()
         {
             if (!ImGui.BeginPopupModal("Delete Plugin?"))
@@ -1430,6 +1607,7 @@ namespace PluginUpdater
 
                     var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
                     var releaseChecksums = PluginUpdater.Instance?.Settings.ReleaseChecksums;
+                    var installDirectories = PluginUpdater.Instance?.Settings.ReleaseInstallDirectories;
                     bool settingsChanged = false;
 
                     if (releaseSources != null && releaseSources.Remove(_pluginToDelete))
@@ -1440,6 +1618,14 @@ namespace PluginUpdater
                     if (releaseChecksums != null && releaseChecksums.Remove(_pluginToDelete))
                     {
                         settingsChanged = true;
+                    }
+
+                    if (installDirectories != null && installDirectories.TryGetValue(_pluginToDelete, out var directoryName))
+                    {
+                        installDirectories.Remove(_pluginToDelete);
+                        settingsChanged = true;
+                        var fullPath = Path.Combine(_pluginRootPath, directoryName);
+                        ClearPendingCleanupEntry(fullPath);
                     }
 
                     if (settingsChanged)
