@@ -1403,7 +1403,7 @@ namespace PluginUpdater
 
         private void RenderDeleteConfirmationModal()
         {
-            if (!ImGui.BeginPopupModal("Delete Plugin?", ImGuiWindowFlags.AlwaysAutoResize))
+            if (!ImGui.BeginPopupModal("Delete Plugin?"))
             {
                 return;
             }

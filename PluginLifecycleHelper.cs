@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.Loader;
 using GameHelper;
 using GameHelper.Plugin;
 
@@ -22,9 +23,12 @@ internal static class PluginLifecycleHelper
                 plugin => plugin != null &&
                           plugin.Name.Equals(pluginName, StringComparison.OrdinalIgnoreCase));
 
+            AssemblyLoadContext loadContext = null;
+
             if (container != null)
             {
                 container.Metadata.Enable = false;
+                loadContext = AssemblyLoadContext.GetLoadContext(container.Plugin.GetType().Assembly);
             }
 
             if (!PManager.UnloadPlugin(pluginName))
@@ -32,6 +36,7 @@ internal static class PluginLifecycleHelper
                 return false;
             }
 
+            TryUnloadAssemblyContext(pluginName, loadContext, consoleLog);
             PManager.SavePluginMetadata();
             EnsureAssembliesReleased();
 
@@ -46,6 +51,33 @@ internal static class PluginLifecycleHelper
             consoleLog?.LogError(message);
             PluginLogger.Error(message);
             return false;
+        }
+    }
+
+    private static void TryUnloadAssemblyContext(string pluginName, AssemblyLoadContext context, ConsoleLog consoleLog)
+    {
+        if (context == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!context.IsCollectible)
+            {
+                var message = $"Plugin {pluginName} is loaded in a non-collectible context and cannot be fully unloaded.";
+                consoleLog?.LogWarning(message);
+                PluginLogger.Warn(message);
+                return;
+            }
+
+            context.Unload();
+        }
+        catch (Exception ex)
+        {
+            var message = $"Failed to unload AssemblyLoadContext for {pluginName}: {ex.Message}";
+            consoleLog?.LogWarning(message);
+            PluginLogger.Warn(message);
         }
     }
 
