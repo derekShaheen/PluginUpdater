@@ -1,6 +1,6 @@
 **Usage**
 
-The "Add" tab now supports both regular github urls `https://github.com/doubleespressobro/WheresMyZoom/` and branch specific urls `https://github.com/doubleespressobro/WheresMyZoom/tree/poe2`
+The "Add" tab now supports Git repositories as well as GitHub release links (for example `https://github.com/derekShaheen/Aura-Tracker-Gamehelper2/releases` or a direct release asset URL). Release archives are automatically extracted into the `Plugins` folder and remembered so they can be re-downloaded later from the Manage tab.
 
 **Preview**
 
@@ -15,10 +15,6 @@ Manage Tab
 Add Tab
 
 ![image](https://github.com/user-attachments/assets/98cea130-5dd2-47c5-96e0-d490ecd436ce)
-
-Browse Tab
-
-![image](https://github.com/user-attachments/assets/df88735b-94f6-4a1a-a00c-04a8b32b7a77)
 
 Settings Tab
 

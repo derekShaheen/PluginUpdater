@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -7,8 +7,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using ExileCore2;
-using ExileCore2.Shared;
 using LibGit2Sharp;
 using LibGit2Sharp.Handlers;
 
@@ -30,11 +28,11 @@ namespace PluginUpdater
         public List<string> AvailableBranches { get; set; } = new();
         public string CurrentBranch { get; set; }
         public string Error { get; set; }
+        public bool IsManualInstall { get; set; }
     }
 
     public class GitUpdater : IDisposable
     {
-        private readonly PluginManager _pluginManager;
         private readonly string _pluginFolder;
         private readonly ConcurrentDictionary<string, PluginInfo> _pluginInfo = new(StringComparer.OrdinalIgnoreCase);
         private CancellationTokenSource _updateCts;
@@ -44,35 +42,38 @@ namespace PluginUpdater
         private void ReportProgress(int current, int total) => ProgressChanged?.Invoke(current, total);
 
         private IEnumerable<PluginInfo> GetGitPlugins() =>
-            Directory.GetDirectories(_pluginFolder).Select(x =>
-            {
-                var resolvedPath = PluginManager.ResolvePluginDirectory(x);
-                var gitPath = Path.Join(resolvedPath, ".git");
-                if (Directory.Exists(gitPath) || File.Exists(gitPath))
+            Directory.GetDirectories(_pluginFolder)
+                .Select(resolvedPath =>
                 {
-                    return CreatePluginInfo(Path.GetFileName(x), resolvedPath);
-                }
+                    var gitPath = Path.Join(resolvedPath, ".git");
+                    if (Directory.Exists(gitPath) || File.Exists(gitPath))
+                    {
+                        return CreatePluginInfo(Path.GetFileName(resolvedPath), resolvedPath);
+                    }
 
-                return null;
-            }).Where(p => p != null);
+                    return null;
+                })
+                .Where(p => p != null);
 
         public IEnumerable<PluginInfo> GetManualPlugins() =>
-            Directory.GetDirectories(_pluginFolder).Select(x =>
-            {
-                var resolvedPath = PluginManager.ResolvePluginDirectory(x);
-                var gitPath = Path.Join(resolvedPath, ".git");
-                if (!Directory.Exists(gitPath) && !File.Exists(gitPath))
+            Directory.GetDirectories(_pluginFolder)
+                .Select(resolvedPath =>
                 {
-                    return CreatePluginInfo(Path.GetFileName(x), resolvedPath);
-                }
+                    var gitPath = Path.Join(resolvedPath, ".git");
+                    if (!Directory.Exists(gitPath) && !File.Exists(gitPath))
+                    {
+                        var pluginInfo = CreatePluginInfo(Path.GetFileName(resolvedPath), resolvedPath);
+                        pluginInfo.IsManualInstall = true;
+                        return pluginInfo;
+                    }
 
-                return null;
-            }).Where(p => p != null);
+                    return null;
+                })
+                .Where(p => p != null);
 
-        public GitUpdater(PluginManager pluginManager)
+        public GitUpdater(string pluginFolder)
         {
-            _pluginManager = pluginManager;
-            _pluginFolder = pluginManager.SourcePluginDirectoryPath;
+            _pluginFolder = pluginFolder;
             UpdateLocal();
         }
 
@@ -97,9 +98,11 @@ namespace PluginUpdater
                 }
                 catch (Exception e)
                 {
-                    DebugWindow.LogError($"Error processing {pluginInfo.Path}: {e}");
+                    PluginLogger.Error($"Error processing {pluginInfo.Path}: {e}");
                 }
             }
+
+            AddManualPlugins();
         }
 
         public async Task UpdateGitInfoAsync()
@@ -123,7 +126,7 @@ namespace PluginUpdater
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
-                    DebugWindow.LogError($"Error during task cancellation: {ex.Message}");
+                    PluginLogger.Error($"Error during task cancellation: {ex.Message}");
                 }
             }
 
@@ -136,11 +139,11 @@ namespace PluginUpdater
             }
             catch (OperationCanceledException)
             {
-                DebugWindow.LogMsg("Git update operation was cancelled");
+                PluginLogger.Info("Git update operation was cancelled");
             }
             catch (Exception ex)
             {
-                DebugWindow.LogError($"Error during git update: {ex.Message}");
+                PluginLogger.Error($"Error during git update: {ex.Message}");
                 throw;
             }
         }
@@ -275,7 +278,7 @@ namespace PluginUpdater
                 }
                 catch (Exception e)
                 {
-                    DebugWindow.LogError($"Error processing {pluginInfo.Path}: {e}");
+                    PluginLogger.Error($"Error processing {pluginInfo.Path}: {e}");
                     pluginInfo.Error = e.Message;
                     if (_pluginInfo.ContainsKey(pluginInfo.Name))
                     {
@@ -294,6 +297,8 @@ namespace PluginUpdater
                     ReportProgress(currentFolder, totalFolders);
                 }
             }
+
+            AddManualPlugins();
         }
 
         public async Task RevertPluginAsync(string pluginName)
@@ -302,7 +307,9 @@ namespace PluginUpdater
             if (folder == null) return;
 
             var plugin = _pluginInfo.GetValueOrDefault(pluginName);
-            if (plugin == null) return;
+            if (plugin == null || plugin.IsManualInstall) return;
+
+            PluginLifecycleHelper.TryUnloadPlugin(pluginName);
 
             await Task.Run(() =>
             {
@@ -314,13 +321,13 @@ namespace PluginUpdater
                     plugin.LastMessage = $"Reset to parent commit {parent.Sha[..7]}";
                     SetPluginInfo(plugin, repo);
 
-                    DebugWindow.LogMsg($"{folder.Path} reverted to {plugin.CurrentCommit}");
-                    DebugWindow.LogMsg(plugin.LastMessage);
+                    PluginLogger.Info($"{folder.Path} reverted to {plugin.CurrentCommit}");
+                    PluginLogger.Info(plugin.LastMessage);
                 }
                 catch (Exception ex)
                 {
                     var errorMsg = $"Error reverting plugin {pluginName}: {ex}";
-                    DebugWindow.LogError(errorMsg);
+                    PluginLogger.Error(errorMsg);
                     throw;
                 }
             });
@@ -332,7 +339,9 @@ namespace PluginUpdater
             if (folder == null) return;
 
             var plugin = _pluginInfo.GetValueOrDefault(pluginName);
-            if (plugin == null) return;
+            if (plugin == null || plugin.IsManualInstall) return;
+
+            PluginLifecycleHelper.TryUnloadPlugin(pluginName);
 
             await Task.Run(() =>
             {
@@ -359,12 +368,12 @@ namespace PluginUpdater
 
                     SetPluginInfo(plugin, repo);
 
-                    DebugWindow.LogMsg($"{folder.Path} updated to {plugin.CurrentCommit}");
-                    DebugWindow.LogMsg(plugin.LastMessage);
+                    PluginLogger.Info($"{folder.Path} updated to {plugin.CurrentCommit}");
+                    PluginLogger.Info(plugin.LastMessage);
                 }
                 catch (Exception ex)
                 {
-                    DebugWindow.LogError($"Error updating plugin {pluginName}: {ex}");
+                    PluginLogger.Error($"Error updating plugin {pluginName}: {ex}");
                     throw;
                 }
             });
@@ -376,7 +385,9 @@ namespace PluginUpdater
             if (folder == null) return;
 
             var plugin = _pluginInfo.GetValueOrDefault(pluginName);
-            if (plugin == null) return;
+            if (plugin == null || plugin.IsManualInstall) return;
+
+            PluginLifecycleHelper.TryUnloadPlugin(pluginName);
 
             await Task.Run(() =>
             {
@@ -405,12 +416,12 @@ namespace PluginUpdater
 
                     SetPluginInfo(plugin, repo);
 
-                    DebugWindow.LogMsg($"{folder.Path} updated to {plugin.CurrentCommit}");
-                    DebugWindow.LogMsg(plugin.LastMessage);
+                    PluginLogger.Info($"{folder.Path} updated to {plugin.CurrentCommit}");
+                    PluginLogger.Info(plugin.LastMessage);
                 }
                 catch (Exception ex)
                 {
-                    DebugWindow.LogError($"Error updating plugin {pluginName}: {ex}");
+                    PluginLogger.Error($"Error updating plugin {pluginName}: {ex}");
                     throw;
                 }
             });
@@ -520,7 +531,7 @@ namespace PluginUpdater
                         }
                         catch (Exception ex)
                         {
-                            DebugWindow.LogError($"Unable to delete {targetPath}: {ex}");
+                            PluginLogger.Error($"Unable to delete {targetPath}: {ex}");
                         }
                     }
                     throw;
@@ -537,10 +548,10 @@ namespace PluginUpdater
 
             try
             {
+                PluginLifecycleHelper.TryUnloadPlugin(pluginName);
+
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
-
-                using (var repo = new Repository(pluginPath)) { }
 
                 foreach (var file in Directory.GetFiles(pluginPath, "*.*", SearchOption.AllDirectories))
                     File.SetAttributes(file, FileAttributes.Normal);
@@ -555,6 +566,14 @@ namespace PluginUpdater
             catch (Exception ex)
             {
                 throw new Exception($"Failed to delete plugin: {ex.Message}", ex);
+            }
+        }
+
+        private void AddManualPlugins()
+        {
+            foreach (var manualPlugin in GetManualPlugins())
+            {
+                _pluginInfo[manualPlugin.Name] = manualPlugin;
             }
         }
 
@@ -618,13 +637,13 @@ namespace PluginUpdater
             }
             catch (Exception ex)
             {
-                DebugWindow.LogError($"Unable to retrieve credentials for {url}: {ex}");
+                PluginLogger.Error($"Unable to retrieve credentials for {url}: {ex}");
                 return new DefaultCredentials();
             }
 
             if (username == null || password == null)
             {
-                DebugWindow.LogError($"Unable to retrieve credentials for {url}");
+                PluginLogger.Error($"Unable to retrieve credentials for {url}");
                 return new DefaultCredentials();
             }
 
@@ -638,7 +657,14 @@ namespace PluginUpdater
         public async Task ChangeBranchAsync(PluginInfo plugin, string branchName)
         {
             var pluginPath = plugin.Path;
-            
+
+            if (plugin.IsManualInstall)
+            {
+                throw new InvalidOperationException($"Plugin {plugin.Name} was installed from a release archive and cannot switch branches.");
+            }
+
+            PluginLifecycleHelper.TryUnloadPlugin(plugin.Name);
+
             await Task.Run(() =>
             {
                 using var repo = new Repository(pluginPath);

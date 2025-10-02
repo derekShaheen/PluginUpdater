@@ -2,56 +2,21 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.Json;
 using System.Threading.Tasks;
-using ExileCore2;
-using ExileCore2.Shared.Attributes;
-using ExileCore2.Shared.Interfaces;
 using ImGuiNET;
 
 namespace PluginUpdater
 {
-    public class PluginRepositoryData
-    {
-        public List<PluginDescription> PluginDescriptions { get; set; }
-    }
-
-    public class PluginDescription
-    {
-        public string Name { get; set; }
-        public string OriginalAuthor { get; set; }
-        public List<Fork> Forks { get; set; }
-        public string Description { get; set; }
-        public string EndorsedAuthor { get; set; }
-    }
-
-    public class Fork
-    {
-        public string Author { get; set; }
-        public string Location { get; set; }
-        public string Name { get; set; }
-        public LatestCommit LatestCommit { get; set; }
-        public List<Release> Releases { get; set; }
-    }
-
-    public class LatestCommit
-    {
-        public string Message { get; set; }
-        public string Hash { get; set; }
-        public string Author { get; set; }
-        public string Date { get; set; }
-    }
-
-    public class Release
-    {
-        // the output.json has no data in releases so not sure structure xd
-    }
-
-    [Submenu(RenderMethod = nameof(Render))]
     public class PluginRenderer : IDisposable
     {
         private readonly ConsoleLog _consoleLog = new();
         private readonly PluginUpdaterSettings _settings;
+        private readonly string _pluginRootPath;
         private GitUpdater _updater;
 
         private bool _isUpdating;
@@ -62,21 +27,24 @@ namespace PluginUpdater
         private bool _isUpdatingAll;
         private string _repoUrl = string.Empty;
         private bool _isCloning;
-        private readonly List<PluginDescription> _availablePlugins = [];
-        private readonly Dictionary<string, bool> _downloadingPlugins = [];
-        private bool _isLoadingRepos;
-        private bool _hasLoadedRepos;
-        private string _loadError = string.Empty;
+        private bool _isDownloadingRelease;
+        private readonly Dictionary<string, bool> _releaseReinstalling = new(StringComparer.OrdinalIgnoreCase);
         private DateTime _lastPeriodicCheckAttempt = DateTime.MinValue;
+        private string _pluginToDelete;
 
-        public PluginRenderer(PluginUpdaterSettings settings)
+        private sealed record ReleaseDownloadInfo(string DownloadUrl, string PluginNameFallback, string NormalizedUrl);
+
+        private sealed record ReleaseUrlParts(string Owner, string Repo, string Tag, bool IsDirectAsset, string AssetName);
+
+        public PluginRenderer(PluginUpdaterSettings settings, string pluginRootPath)
         {
             _settings = settings;
+            _pluginRootPath = pluginRootPath;
         }
 
         public void Startup()
         {
-            _updater = new GitUpdater(PluginUpdater.Instance.PluginManager);
+            _updater = new GitUpdater(_pluginRootPath);
             _updater.ProgressChanged += (current, total) =>
             {
                 _currentProgress = current;
@@ -86,7 +54,7 @@ namespace PluginUpdater
             var manuallyDownloadedPlugins = _updater.GetManualPlugins();
             foreach (var plugin in manuallyDownloadedPlugins)
             {
-                _consoleLog.LogWarning($"{Path.GetFileName(plugin.Name)} was downloaded manually so cannot be updated via this plugin");
+                _consoleLog.LogInfo($"{plugin.Name} is managed via release archives. Use the Add tab to redownload when new releases are available.");
             }
 
             if (_settings.CheckUpdatesOnStartup && !_settings.HasCheckedUpdates)
@@ -118,8 +86,6 @@ namespace PluginUpdater
 
             try
             {
-                PluginUpdater.Instance.RemoveNotification("", "PendingUpdates");
-
                 _isUpdating = true;
                 await _updater.UpdateGitInfoAsync();
 
@@ -127,15 +93,15 @@ namespace PluginUpdater
                 int updateCount = plugins.Count(p => p.CurrentCommit != p.LatestCommit);
                 if (updateCount > 0)
                 {
-                    _consoleLog.AddNotificationMessage("PendingUpdates", $"There is {updateCount} plugin {(updateCount > 1 ? "updates" : "update")} pending.",
-                        ConsoleLog.ColorInfo);
+                    var updateLabel = updateCount == 1 ? "update" : "updates";
+                    _consoleLog.LogInfo($"There {(updateCount == 1 ? "is" : "are")} {updateCount} plugin {updateLabel} pending.");
                 }
             }
             catch (Exception e)
             {
                 var errorMsg = $"Error updating git info: {e}";
-                DebugWindow.LogError(errorMsg);
-                _consoleLog.LogError($"{errorMsg}");
+                PluginLogger.Error(errorMsg);
+                _consoleLog.LogError(errorMsg);
             }
             finally
             {
@@ -175,13 +141,12 @@ namespace PluginUpdater
                 }
 
                 _consoleLog.LogSuccess($"Successfully updated {pluginName}");
-                PluginUpdater.Instance.RemoveNotification("", "PendingUpdates");
             }
             catch (Exception e)
             {
                 var errorMsg = $"Error updating plugin {pluginName}: {e.Message}";
-                DebugWindow.LogError(errorMsg);
-                _consoleLog.LogError($"{errorMsg}");
+                PluginLogger.Error(errorMsg);
+                _consoleLog.LogError(errorMsg);
             }
             finally
             {
@@ -197,7 +162,10 @@ namespace PluginUpdater
             {
                 _isUpdatingAll = true;
                 var plugins = _updater.GetPluginInfo();
-                var outdatedPlugins = plugins.Where(p => p.CurrentCommit != p.LatestCommit).ToList();
+                var outdatedPlugins = plugins
+                    .Where(p => !p.IsManualInstall)
+                    .Where(p => p.CurrentCommit != p.LatestCommit)
+                    .ToList();
 
                 _consoleLog.LogInfo($"Starting update for {outdatedPlugins.Count} plugins...");
 
@@ -205,23 +173,20 @@ namespace PluginUpdater
                 {
                     await UpdatePluginAsync(plugin.Name, false);
                 }
-
-                PluginUpdater.Instance.RemoveNotification("", "PendingUpdates");
             }
             catch (Exception e)
             {
-                DebugWindow.LogError($"Error updating all plugins: {e.Message}");
+                PluginLogger.Error($"Error updating all plugins: {e.Message}");
             }
             finally
             {
                 _isUpdatingAll = false;
-                _settings.GameController.Memory.Dispose();
             }
         }
 
-        public void Render()
+        public void DrawSettings()
         {
-            if (!_settings.Enable.Value)
+            if (!_settings.Enable)
                 return;
 
             if (ImGui.BeginTabBar("PluginManagerTabs"))
@@ -231,6 +196,7 @@ namespace PluginUpdater
                     ImGui.Spacing();
                     RenderUpdateButtons();
                     RenderPluginsTable();
+                    RenderDeleteConfirmationModal();
                     ImGui.EndTabItem();
                 }
 
@@ -238,13 +204,6 @@ namespace PluginUpdater
                 {
                     ImGui.Spacing();
                     RenderAddPluginSection();
-                    ImGui.EndTabItem();
-                }
-
-                if (ImGui.BeginTabItem("Browse"))
-                {
-                    ImGui.Spacing();
-                    RenderPluginBrowser();
                     ImGui.EndTabItem();
                 }
 
@@ -263,6 +222,14 @@ namespace PluginUpdater
 
         private void RenderSettings()
         {
+            bool isEnabled = _settings.Enable;
+            if (ImGui.Checkbox("Enable plugin updater", ref isEnabled))
+            {
+                _settings.Enable = isEnabled;
+            }
+
+            ImGui.Spacing();
+
             bool checkStartup = _settings.CheckUpdatesOnStartup;
             if (ImGui.Checkbox("Check for updates on startup", ref checkStartup))
             {
@@ -323,6 +290,7 @@ namespace PluginUpdater
                     ImGui.EndCombo();
                 }
             }
+
         }
 
         private string _pluginNameFilter = "";
@@ -356,7 +324,8 @@ namespace PluginUpdater
                 }
 
                 var plugins = _updater.GetPluginInfo();
-                bool hasUpdates = plugins.Any(p => p.CurrentCommit != p.LatestCommit);
+                var gitPlugins = plugins.Where(p => !p.IsManualInstall).ToList();
+                bool hasUpdates = gitPlugins.Any(p => p.CurrentCommit != p.LatestCommit);
 
                 if (hasUpdates)
                 {
@@ -457,7 +426,7 @@ namespace PluginUpdater
                 }
                 catch (Exception e)
                 {
-                    DebugWindow.LogError($"Error rendering plugin {pluginInfo.Name}: {e.Message}");
+                    PluginLogger.Error($"Error rendering plugin {pluginInfo.Name}: {e.Message}");
                 }
             }
         }
@@ -538,6 +507,22 @@ namespace PluginUpdater
                 return;
             }
 
+            if (pluginInfo.IsManualInstall)
+            {
+                var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                if (releaseSources != null && releaseSources.TryGetValue(pluginInfo.Name, out var source))
+                {
+                    ImGui.TextWrapped($"Installed from release: {source}");
+                }
+                else
+                {
+                    ImGui.TextWrapped("Installed from release archive. Use the Add tab to redownload when updates are available.");
+                }
+
+                ImGui.TableNextColumn();
+                return;
+            }
+
             string text;
             if (string.IsNullOrEmpty(pluginInfo.LatestCommit))
             {
@@ -589,8 +574,8 @@ namespace PluginUpdater
             catch (Exception e)
             {
                 var errorMsg = $"Error reverting plugin {pluginName}: {e.Message}";
-                DebugWindow.LogError(errorMsg);
-                _consoleLog.LogError($"{errorMsg}");
+                PluginLogger.Error(errorMsg);
+                _consoleLog.LogError(errorMsg);
             }
             finally
             {
@@ -600,7 +585,39 @@ namespace PluginUpdater
 
         private void RenderActionButtons(PluginInfo pluginInfo)
         {
-            if (!string.IsNullOrEmpty(pluginInfo.CurrentCommit))
+            if (pluginInfo.IsManualInstall)
+            {
+                var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                var hasSource = releaseSources != null && releaseSources.TryGetValue(pluginInfo.Name, out var releaseUrl) && !string.IsNullOrWhiteSpace(releaseUrl);
+                bool isReinstalling = _releaseReinstalling.TryGetValue(pluginInfo.Name, out bool reinstalling) && reinstalling;
+
+                if (hasSource)
+                {
+                    if (isReinstalling)
+                    {
+                        ImGui.BeginDisabled();
+                        ImGui.Button($"Redownloading...##{pluginInfo.Name}");
+                        ImGui.EndDisabled();
+                    }
+                    else if (ImGui.Button($"Redownload##{pluginInfo.Name}"))
+                    {
+                        _ = DownloadReleaseAsync(releaseUrl, pluginInfo.Name);
+                    }
+
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip("Download the latest release archive from the saved URL and replace the plugin files.");
+                    }
+
+                    ImGui.SameLine();
+                }
+                else
+                {
+                    ImGui.TextDisabled("No release URL saved");
+                    ImGui.SameLine();
+                }
+            }
+            else if (!string.IsNullOrEmpty(pluginInfo.CurrentCommit))
             {
                 bool isUpdating = _updatingPlugins.TryGetValue(pluginInfo.Name, out bool updating) && updating;
                 bool isReverting = _revertingPlugins.TryGetValue(pluginInfo.Name, out bool reverting) && reverting;
@@ -610,24 +627,26 @@ namespace PluginUpdater
                     ImGui.BeginDisabled(isReverting || isUpdating);
                     if (pluginInfo.AheadBy == 0 || pluginInfo.BehindBy != 0)
                     {
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0, 0.5f, 0, 1.0f)))
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0, 0.7f, 0, 1.0f)))
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0, 0.3f, 0, 1.0f)))
-                            if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Update##{pluginInfo.Name}"))
-                            {
-                                _ = UpdatePluginAsync(pluginInfo.Name, false);
-                            }
+                        ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0, 0.5f, 0, 1.0f));
+                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0, 0.7f, 0, 1.0f));
+                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0, 0.3f, 0, 1.0f));
+                        if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Update##{pluginInfo.Name}"))
+                        {
+                            _ = UpdatePluginAsync(pluginInfo.Name, false);
+                        }
 
+                        ImGui.PopStyleColor(3);
                         ImGui.SameLine();
                     }
 
-                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f)))
-                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f)))
-                    using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f)))
-                        if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Force update##{pluginInfo.Name}"))
-                        {
-                            ImGui.OpenPopup($"Force update plugin {pluginInfo.Name}");
-                        }
+                    ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f));
+                    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f));
+                    ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f));
+                    if (ImGui.Button(isUpdating ? $"Updating...##{pluginInfo.Name}" : $"Force update##{pluginInfo.Name}"))
+                    {
+                        ImGui.OpenPopup($"Force update plugin {pluginInfo.Name}");
+                    }
+                    ImGui.PopStyleColor(3);
 
                     if (ImGui.BeginPopupModal($"Force update plugin {pluginInfo.Name}"))
                     {
@@ -639,15 +658,17 @@ namespace PluginUpdater
                         float totalWidth = buttonWidth * 2 + spacing;
                         ImGui.SetCursorPosX((ImGui.GetWindowSize().X - totalWidth) * 0.5f);
 
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f)))
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f)))
-                        using (ImGuiHelpers.UseStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f)))
+                        ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f));
+                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f));
+                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f));
 
-                            if (ImGui.Button("Force update", new System.Numerics.Vector2(buttonWidth, 0)))
-                            {
-                                ImGui.CloseCurrentPopup();
-                                _ = UpdatePluginAsync(pluginInfo.Name, true);
-                            }
+                        if (ImGui.Button("Force update", new System.Numerics.Vector2(buttonWidth, 0)))
+                        {
+                            ImGui.CloseCurrentPopup();
+                            _ = UpdatePluginAsync(pluginInfo.Name, true);
+                        }
+
+                        ImGui.PopStyleColor(3);
 
                         ImGui.SameLine(0, spacing);
                         if (ImGui.Button("Cancel", new System.Numerics.Vector2(buttonWidth, 0)))
@@ -684,14 +705,21 @@ namespace PluginUpdater
                 Process.Start("explorer.exe", pluginInfo.Path);
             }
 
+            ImGui.SameLine();
+            if (ImGui.Button($"Delete##{pluginInfo.Name}"))
+            {
+                _pluginToDelete = pluginInfo.Name;
+                ImGui.OpenPopup("Delete Plugin?");
+            }
+
             ImGui.TableNextColumn();
         }
 
         private void RenderAddPluginSection()
         {
-            ImGui.Text("Enter Repository URL:");
+            ImGui.Text("Enter Plugin Source URL:");
 
-            var width = ImGui.GetContentRegionAvail().X - 100;
+            var width = Math.Max(150f, ImGui.GetContentRegionAvail().X - 220f);
             ImGui.SetNextItemWidth(width);
             ImGui.InputText("##repoinput", ref _repoUrl, 1024);
 
@@ -700,14 +728,21 @@ namespace PluginUpdater
             if (_isCloning)
             {
                 ImGui.BeginDisabled();
-                ImGui.Button("Cloning...");
+                ImGui.Button("Cloning Git...");
                 ImGui.EndDisabled();
             }
-            else if (ImGui.Button("Clone"))
+            else if (ImGui.Button("Clone Git"))
             {
                 if (!string.IsNullOrWhiteSpace(_repoUrl))
                 {
-                    _ = CloneRepositoryAsync(_repoUrl);
+                    if (TryParseGitHubReleaseUrl(_repoUrl, out _))
+                    {
+                        _consoleLog.LogWarning("This appears to be a GitHub release link. Use the Download Release button instead.");
+                    }
+                    else
+                    {
+                        _ = CloneRepositoryAsync(_repoUrl);
+                    }
                 }
                 else
                 {
@@ -720,9 +755,34 @@ namespace PluginUpdater
                 ImGui.SetTooltip("Clone the repository into the plugins folder");
             }
 
+            ImGui.SameLine();
+
+            if (_isDownloadingRelease)
+            {
+                ImGui.BeginDisabled();
+                ImGui.Button("Downloading release...");
+                ImGui.EndDisabled();
+            }
+            else if (ImGui.Button("Download Release"))
+            {
+                if (!string.IsNullOrWhiteSpace(_repoUrl))
+                {
+                    _ = DownloadReleaseAsync(_repoUrl);
+                }
+                else
+                {
+                    _consoleLog.LogWarning("Please enter a release URL");
+                }
+            }
+
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip("Download the latest release archive from GitHub and extract it into the plugins folder");
+            }
+
             ImGui.Spacing();
-            ImGui.TextWrapped("Enter the URL of a Git repository to clone. " +
-                              "The repository will be cloned into the Plugins\\Source folder.");
+            ImGui.TextWrapped("Provide a Git repository URL or a GitHub release link (including direct .zip asset URLs). " +
+                              "Release archives are automatically extracted into the Plugins folder.");
         }
 
         private async Task CloneRepositoryAsync(string repoUrl)
@@ -749,278 +809,396 @@ namespace PluginUpdater
             }
         }
 
-        private static readonly System.Text.Json.JsonSerializerOptions SerializerOptions = new()
+        private async Task DownloadReleaseAsync(string releaseUrl, string existingPluginName = null)
         {
-            PropertyNameCaseInsensitive = true,
-        };
+            if (string.IsNullOrWhiteSpace(releaseUrl))
+            {
+                _consoleLog.LogWarning("Please enter a release URL");
+                return;
+            }
 
-        private async Task LoadRepositoriesAsync()
-        {
-            if (_isLoadingRepos || _hasLoadedRepos) return;
+            bool isReinstall = !string.IsNullOrWhiteSpace(existingPluginName);
+
+            if (isReinstall)
+            {
+                if (_releaseReinstalling.TryGetValue(existingPluginName, out bool running) && running)
+                {
+                    return;
+                }
+
+                _releaseReinstalling[existingPluginName] = true;
+            }
+            else
+            {
+                if (_isDownloadingRelease)
+                {
+                    return;
+                }
+
+                _isDownloadingRelease = true;
+            }
+
+            string tempZip = Path.Combine(Path.GetTempPath(), $"PluginUpdater_{Guid.NewGuid():N}.zip");
+            string tempDirectory = Path.Combine(Path.GetTempPath(), $"PluginUpdater_{Guid.NewGuid():N}");
 
             try
             {
-                _isLoadingRepos = true;
-                _loadError = string.Empty;
+                Directory.CreateDirectory(tempDirectory);
 
-                using var client = new System.Net.Http.HttpClient();
-                var response = await client.GetStringAsync("https://raw.githubusercontent.com/exCore2/PluginBrowserData/refs/heads/data/output.json");
+                var releaseInfo = await ResolveReleaseAsync(releaseUrl);
 
-                var repoData = System.Text.Json.JsonSerializer.Deserialize<PluginRepositoryData>(
-                    response,
-                    SerializerOptions
-                );
+                _consoleLog.LogInfo($"Downloading release from {releaseInfo.NormalizedUrl}...");
 
-                _availablePlugins.Clear();
-                if (repoData?.PluginDescriptions != null)
+                await DownloadFileAsync(releaseInfo.DownloadUrl, tempZip);
+
+                ZipFile.ExtractToDirectory(tempZip, tempDirectory, true);
+
+                var (sourceDirectory, pluginName) = DetermineExtractionRoot(tempDirectory, existingPluginName, releaseInfo.PluginNameFallback);
+                pluginName = SanitizePluginName(pluginName);
+
+                var targetDirectory = Path.Combine(_pluginRootPath, pluginName);
+
+                if (Directory.Exists(targetDirectory))
                 {
-                    _availablePlugins.AddRange(repoData.PluginDescriptions);
-                }
-
-                _hasLoadedRepos = true;
-                _consoleLog.LogSuccess($"Successfully loaded {_availablePlugins.Count} plugins");
-            }
-            catch (Exception ex)
-            {
-                _loadError = $"Error loading plugins: {ex.Message}";
-                _consoleLog.LogError(_loadError);
-            }
-            finally
-            {
-                _isLoadingRepos = false;
-            }
-        }
-
-        private string _pluginToDelete = null;
-
-        private void RenderPluginBrowser()
-        {
-            if (!_hasLoadedRepos && !_isLoadingRepos)
-            {
-                _ = LoadRepositoriesAsync();
-            }
-
-            ImGui.TextWrapped("Browse and download available plugins from the ExileCore2 organization.");
-            ImGui.Spacing();
-
-            if (_isLoadingRepos)
-            {
-                ImGui.TextWrapped("Loading available plugins...");
-                return;
-            }
-
-            if (!string.IsNullOrEmpty(_loadError))
-            {
-                ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1.0f, 0.2f, 0.2f, 1.0f));
-                ImGui.TextWrapped(_loadError);
-                ImGui.PopStyleColor();
-
-                if (ImGui.Button("Retry"))
-                {
-                    _hasLoadedRepos = false;
-                    _loadError = string.Empty;
-                    _ = LoadRepositoriesAsync();
-                }
-
-                return;
-            }
-
-            var tableFlags = ImGuiTableFlags.Borders |
-                             ImGuiTableFlags.Resizable |
-                             ImGuiTableFlags.SizingFixedFit |
-                             ImGuiTableFlags.ScrollX |
-                             ImGuiTableFlags.ScrollY |
-                             ImGuiTableFlags.RowBg |
-                             ImGuiTableFlags.Hideable;
-
-            var installedPlugins = _updater.GetPluginInfo();
-
-            if (_availablePlugins.Count == 0)
-            {
-                ImGui.TextColored(new System.Numerics.Vector4(1.0f, 0.2f, 0.2f, 1.0f), "No plugins found in the repository.");
-                return;
-            }
-
-            float rowHeight = Math.Max(
-                ImGui.GetTextLineHeightWithSpacing(),
-                ImGui.GetFrameHeight() + ImGui.GetStyle().FramePadding.Y * 2
-            );
-
-            float totalTableHeight = rowHeight * (_availablePlugins.Count + 1);
-            float panelHeight = ImGui.GetContentRegionAvail().Y;
-            float tableHeight = Math.Min(totalTableHeight, panelHeight * 0.60f);
-
-            if (!ImGui.BeginTable("##browsertable", 6, tableFlags, new System.Numerics.Vector2(-1, tableHeight)))
-                return;
-
-            ImGui.TableSetupColumn("Plugin", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableSetupColumn("Description", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableSetupColumn("Original Author", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableSetupColumn("Endorsed Fork", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableSetupColumn("Last Updated", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 50);
-            ImGui.TableHeadersRow();
-
-            foreach (var plugin in _availablePlugins)
-            {
-                ImGui.TableNextRow();
-
-                ImGui.TableNextColumn();
-                ImGui.Text(plugin.Name);
-
-                ImGui.TableNextColumn();
-                ImGui.TextWrapped(string.IsNullOrEmpty(plugin.Description) ? "-" : plugin.Description);
-
-                ImGui.TableNextColumn();
-                ImGui.Text(string.IsNullOrEmpty(plugin.OriginalAuthor) ? "-" : plugin.OriginalAuthor);
-
-                ImGui.TableNextColumn();
-                ImGui.Text(string.IsNullOrEmpty(plugin.EndorsedAuthor) ? "-" : plugin.EndorsedAuthor);
-
-                var endorsedFork = string.IsNullOrWhiteSpace(plugin.EndorsedAuthor)
-                    ? plugin.Forks?.FirstOrDefault()
-                    : plugin.Forks?.FirstOrDefault(f => f.Author == plugin.EndorsedAuthor);
-
-                ImGui.TableNextColumn();
-                var lastUpdated = endorsedFork?.LatestCommit?.Date ?? "-";
-                if (lastUpdated != "-")
-                {
-                    lastUpdated = DateTime.Parse(lastUpdated).ToString("yyyy-MM-dd");
-                }
-
-                ImGui.Text(lastUpdated);
-
-                ImGui.TableNextColumn();
-
-                if (endorsedFork == null) continue;
-
-                bool isInstalled = installedPlugins.Any(ip =>
-                    ip.Name.Equals(endorsedFork.Name, StringComparison.OrdinalIgnoreCase));
-
-                if (isInstalled)
-                {
-                    ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f));
-                    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f));
-                    ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f));
-
-                    if (ImGui.Button($"Delete##{endorsedFork.Name}"))
-                    {
-                        _pluginToDelete = endorsedFork.Name;
-                        ImGui.OpenPopup("Delete Plugin?");
-                    }
-
-                    if (ImGui.IsItemHovered())
-                    {
-                        ImGui.SetTooltip("Delete this plugin");
-                    }
-
-                    ImGui.PopStyleColor(3);
+                    PluginLifecycleHelper.TryUnloadPlugin(pluginName, _consoleLog);
+                    DeleteDirectory(targetDirectory);
+                    _consoleLog.LogInfo($"Replacing existing plugin {pluginName} with the downloaded release");
                 }
                 else
                 {
-                    bool isDownloading = _downloadingPlugins.TryGetValue(plugin.Name, out bool downloading) && downloading;
-
-                    if (isDownloading)
-                    {
-                        ImGui.BeginDisabled();
-                        ImGui.Button($"Downloading...##{plugin.Name}");
-                        ImGui.EndDisabled();
-                    }
-                    else
-                    {
-                        ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0, 0.5f, 0, 1.0f));
-                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(0, 0.7f, 0, 1.0f));
-                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0, 0.3f, 0, 1.0f));
-
-                        if (ImGui.Button($"Download##{plugin.Name}"))
-                        {
-                            string cloneUrl = $"https://github.com/{endorsedFork.Location}/{endorsedFork.Name}.git";
-                            _ = DownloadPluginAsync(plugin.Name, cloneUrl);
-                        }
-
-                        if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(endorsedFork.LatestCommit?.Message))
-                        {
-                            ImGui.SetTooltip($"Latest commit: {endorsedFork.LatestCommit.Message}");
-                        }
-
-                        ImGui.PopStyleColor(3);
-                    }
+                    _consoleLog.LogInfo($"Installing plugin {pluginName} from release archive");
                 }
-            }
 
-            if (ImGui.BeginPopupModal("Delete Plugin?"))
-            {
-                ImGui.Text($"Are you sure you want to delete the plugin '{_pluginToDelete}'?");
-                ImGui.Text("This action cannot be undone!");
-                ImGui.Spacing();
+                Directory.CreateDirectory(targetDirectory);
+                CopyDirectoryContents(sourceDirectory, targetDirectory);
 
-                float buttonWidth = 120;
-                float spacing = 20;
-                float totalWidth = (buttonWidth * 2) + spacing;
-                ImGui.SetCursorPosX((ImGui.GetWindowSize().X - totalWidth) * 0.5f);
+                _consoleLog.LogSuccess($"Installed release for {pluginName}");
 
-                ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f));
-
-                if (ImGui.Button("Delete", new System.Numerics.Vector2(buttonWidth, 0)))
+                if (!isReinstall)
                 {
-                    try
-                    {
-                        _updater.DeletePlugin(_pluginToDelete);
-                        _consoleLog.LogSuccess($"Successfully deleted plugin: {_pluginToDelete}");
-                        ImGui.CloseCurrentPopup();
-                    }
-                    catch (Exception ex)
-                    {
-                        _consoleLog.LogError($"Failed to delete plugin: {ex.Message}");
-                        ImGui.CloseCurrentPopup();
-                    }
+                    _repoUrl = string.Empty;
                 }
 
-                ImGui.PopStyleColor(3);
-
-                ImGui.SameLine(0, spacing);
-                if (ImGui.Button("Cancel", new System.Numerics.Vector2(buttonWidth, 0)))
+                var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                if (releaseSources != null)
                 {
-                    ImGui.CloseCurrentPopup();
+                    releaseSources[pluginName] = releaseInfo.NormalizedUrl;
+                    PluginUpdater.Instance?.SaveSettings();
                 }
 
-                ImGui.EndPopup();
-            }
-
-            ImGui.EndTable();
-        }
-
-        private async Task DownloadPluginAsync(string pluginName, string cloneUrl)
-        {
-            if (_downloadingPlugins.TryGetValue(pluginName, out bool isDownloading) && isDownloading)
-                return;
-
-            try
-            {
-                _downloadingPlugins[pluginName] = true;
-                _consoleLog.LogInfo($"Downloading plugin: {pluginName}");
-
-                await _updater.CloneRepositoryAsync(cloneUrl);
-
-                _consoleLog.LogSuccess($"Successfully downloaded {pluginName}");
+                _updater.UpdateLocal();
             }
             catch (Exception ex)
             {
-                var additionalDetails = ex.Message switch
-                {
-                    var x when x.Contains("unknown certificate lookup failure", StringComparison.OrdinalIgnoreCase) =>
-                        $"This probably means your internet connection to the server the plugin is hosted on ({cloneUrl}) is being disrupted by something",
-                    _ => "",
-                };
-                _consoleLog.LogError($"Error downloading plugin {pluginName}: {ex.Message} {additionalDetails}");
+                _consoleLog.LogError($"Error downloading release: {ex.Message}");
             }
             finally
             {
-                _downloadingPlugins[pluginName] = false;
+                if (File.Exists(tempZip))
+                {
+                    try
+                    {
+                        File.Delete(tempZip);
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
+                }
+
+                if (Directory.Exists(tempDirectory))
+                {
+                    try
+                    {
+                        Directory.Delete(tempDirectory, true);
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
+                }
+
+                if (isReinstall)
+                {
+                    _releaseReinstalling.Remove(existingPluginName);
+                }
+                else
+                {
+                    _isDownloadingRelease = false;
+                }
             }
         }
+
+        private static async Task DownloadFileAsync(string url, string destinationPath)
+        {
+            using var client = CreateHttpClient();
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            await using var fileStream = File.Create(destinationPath);
+            await stream.CopyToAsync(fileStream);
+        }
+
+        private async Task<ReleaseDownloadInfo> ResolveReleaseAsync(string releaseUrl)
+        {
+            if (!TryParseGitHubReleaseUrl(releaseUrl, out var parts))
+            {
+                throw new InvalidOperationException("Only GitHub release URLs are supported");
+            }
+
+            if (parts.IsDirectAsset)
+            {
+                var fallback = Path.GetFileNameWithoutExtension(parts.AssetName);
+                var normalized = string.IsNullOrWhiteSpace(parts.Tag)
+                    ? $"https://github.com/{parts.Owner}/{parts.Repo}/releases"
+                    : $"https://github.com/{parts.Owner}/{parts.Repo}/releases/tag/{parts.Tag}";
+
+                return new ReleaseDownloadInfo(releaseUrl, fallback, normalized);
+            }
+
+            var apiSuffix = !string.IsNullOrWhiteSpace(parts.Tag)
+                ? $"tags/{parts.Tag}"
+                : "latest";
+
+            var apiUrl = $"https://api.github.com/repos/{parts.Owner}/{parts.Repo}/releases/{apiSuffix}";
+
+            using var client = CreateHttpClient();
+            using var response = await client.GetAsync(apiUrl);
+            response.EnsureSuccessStatusCode();
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+
+            var root = document.RootElement;
+
+            string tagName = null;
+            if (root.TryGetProperty("tag_name", out var tagProperty))
+            {
+                tagName = tagProperty.GetString();
+            }
+
+            string downloadUrl = null;
+            string assetName = null;
+
+            if (root.TryGetProperty("assets", out var assets))
+            {
+                foreach (var asset in assets.EnumerateArray())
+                {
+                    var candidateUrl = asset.TryGetProperty("browser_download_url", out var urlProperty)
+                        ? urlProperty.GetString()
+                        : null;
+
+                    if (string.IsNullOrWhiteSpace(candidateUrl) ||
+                        !candidateUrl.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    downloadUrl = candidateUrl;
+                    assetName = asset.TryGetProperty("name", out var nameProperty) ? nameProperty.GetString() : null;
+                    break;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(downloadUrl))
+            {
+                throw new InvalidOperationException("No .zip assets found for the specified release");
+            }
+
+            var fallbackName = !string.IsNullOrWhiteSpace(assetName)
+                ? Path.GetFileNameWithoutExtension(assetName)
+                : parts.Repo;
+
+            var normalizedUrl = !string.IsNullOrWhiteSpace(tagName)
+                ? $"https://github.com/{parts.Owner}/{parts.Repo}/releases/tag/{tagName}"
+                : $"https://github.com/{parts.Owner}/{parts.Repo}/releases";
+
+            return new ReleaseDownloadInfo(downloadUrl, fallbackName, normalizedUrl);
+        }
+
+        private static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient();
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("PluginUpdater", "1.0"));
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+            return client;
+        }
+
+        private static bool TryParseGitHubReleaseUrl(string releaseUrl, out ReleaseUrlParts parts)
+        {
+            parts = null;
+
+            if (!Uri.TryCreate(releaseUrl, UriKind.Absolute, out var uri))
+            {
+                return false;
+            }
+
+            if (!uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var segments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 3)
+            {
+                return false;
+            }
+
+            if (!segments[2].Equals("releases", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var owner = segments[0];
+            var repo = segments[1];
+            string tag = null;
+            bool isDirectAsset = false;
+            string assetName = null;
+
+            if (segments.Length >= 4)
+            {
+                var segment = segments[3];
+                if (segment.Equals("tag", StringComparison.OrdinalIgnoreCase) && segments.Length >= 5)
+                {
+                    tag = segments[4];
+                }
+                else if (segment.Equals("download", StringComparison.OrdinalIgnoreCase) && segments.Length >= 6)
+                {
+                    isDirectAsset = true;
+                    tag = segments[4];
+                    assetName = segments[5];
+                }
+            }
+
+            parts = new ReleaseUrlParts(owner, repo, tag, isDirectAsset, assetName);
+            return true;
+        }
+
+        private static (string SourceDirectory, string PluginName) DetermineExtractionRoot(string extractedRoot, string existingPluginName, string fallbackName)
+        {
+            if (!string.IsNullOrWhiteSpace(existingPluginName))
+            {
+                return (extractedRoot, existingPluginName);
+            }
+
+            var directories = Directory.GetDirectories(extractedRoot);
+            var files = Directory.GetFiles(extractedRoot);
+
+            if (directories.Length == 1 && files.Length == 0)
+            {
+                var directory = directories[0];
+                var name = Path.GetFileName(directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                return (directory, string.IsNullOrWhiteSpace(name) ? fallbackName : name);
+            }
+
+            return (extractedRoot, fallbackName);
+        }
+
+        private static void CopyDirectoryContents(string sourceDirectory, string targetDirectory)
+        {
+            foreach (var directory in Directory.GetDirectories(sourceDirectory, "*", SearchOption.AllDirectories))
+            {
+                var relative = Path.GetRelativePath(sourceDirectory, directory);
+                Directory.CreateDirectory(Path.Combine(targetDirectory, relative));
+            }
+
+            foreach (var file in Directory.GetFiles(sourceDirectory, "*", SearchOption.AllDirectories))
+            {
+                var relative = Path.GetRelativePath(sourceDirectory, file);
+                var destination = Path.Combine(targetDirectory, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                File.Copy(file, destination, true);
+            }
+        }
+
+        private static void DeleteDirectory(string directory)
+        {
+            foreach (var file in Directory.GetFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                File.SetAttributes(file, FileAttributes.Normal);
+            }
+
+            foreach (var dir in Directory.GetDirectories(directory, "*", SearchOption.AllDirectories))
+            {
+                File.SetAttributes(dir, FileAttributes.Normal);
+            }
+
+            Directory.Delete(directory, true);
+        }
+
+        private static string SanitizePluginName(string pluginName)
+        {
+            if (string.IsNullOrWhiteSpace(pluginName))
+            {
+                return $"Plugin_{Guid.NewGuid():N}";
+            }
+
+            var invalidChars = Path.GetInvalidFileNameChars();
+            var sanitized = new string(pluginName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
+
+            return string.IsNullOrWhiteSpace(sanitized) ? $"Plugin_{Guid.NewGuid():N}" : sanitized;
+        }
+
+        private void RenderDeleteConfirmationModal()
+        {
+            if (!ImGui.BeginPopupModal("Delete Plugin?", ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                return;
+            }
+
+            ImGui.Text($"Are you sure you want to delete the plugin '{_pluginToDelete}'?");
+            ImGui.Text("This action cannot be undone!");
+            ImGui.Spacing();
+
+            float buttonWidth = 120f;
+            float spacing = 20f;
+            float totalWidth = (buttonWidth * 2f) + spacing;
+            ImGui.SetCursorPosX((ImGui.GetWindowSize().X - totalWidth) * 0.5f);
+
+            ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new System.Numerics.Vector4(0.6f, 0.1f, 0.1f, 1.0f));
+
+            if (ImGui.Button("Delete", new System.Numerics.Vector2(buttonWidth, 0)))
+            {
+                try
+                {
+                    _updater.DeletePlugin(_pluginToDelete);
+                    _consoleLog.LogSuccess($"Successfully deleted plugin: {_pluginToDelete}");
+
+                    var releaseSources = PluginUpdater.Instance?.Settings.ReleaseSources;
+                    if (releaseSources != null && releaseSources.Remove(_pluginToDelete))
+                    {
+                        PluginUpdater.Instance?.SaveSettings();
+                    }
+
+                    _updater.UpdateLocal();
+                }
+                catch (Exception ex)
+                {
+                    _consoleLog.LogError($"Failed to delete plugin: {ex.Message}");
+                }
+                finally
+                {
+                    _pluginToDelete = null;
+                    ImGui.CloseCurrentPopup();
+                }
+            }
+
+            ImGui.PopStyleColor(3);
+
+            ImGui.SameLine(0, spacing);
+            if (ImGui.Button("Cancel", new System.Numerics.Vector2(buttonWidth, 0)))
+            {
+                _pluginToDelete = null;
+                ImGui.CloseCurrentPopup();
+            }
+
+            ImGui.EndPopup();
+        }
+
+
 
 
         public void Dispose()
