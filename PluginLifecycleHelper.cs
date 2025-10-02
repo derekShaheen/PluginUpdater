@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using GameHelper;
@@ -17,18 +18,10 @@ internal static class PluginLifecycleHelper
 
         try
         {
-            var container = PManager.Plugins.FirstOrDefault(
-                plugin => plugin != null &&
-                          plugin.Name.Equals(pluginName, StringComparison.OrdinalIgnoreCase));
-
-            if (container == null)
+            if (!PManager.UnloadPlugin(pluginName))
             {
                 return false;
             }
-
-            container.Plugin.SaveSettings();
-            container.Plugin.OnDisable();
-            PManager.Plugins.Remove(container);
 
             var successMessage = $"Unloaded plugin {pluginName} before file operations.";
             consoleLog?.LogInfo(successMessage);
@@ -59,8 +52,9 @@ internal static class PluginLifecycleHelper
                 return false;
             }
 
-            var pluginWithName = PManager.LoadPlugin(directoryInfo);
-            if (pluginWithName == null)
+            var knownNames = new HashSet<string>(PManager.Plugins.Select(p => p.Name), StringComparer.OrdinalIgnoreCase);
+
+            if (!PManager.LoadPlugin(pluginName))
             {
                 var message = $"GameHelper failed to load plugin from {directoryInfo.FullName}.";
                 consoleLog?.LogWarning(message);
@@ -68,25 +62,20 @@ internal static class PluginLifecycleHelper
                 return false;
             }
 
-            PManager.LoadPluginMetadata(new[] { pluginWithName });
-
-            var resolvedName = string.IsNullOrWhiteSpace(pluginWithName.Name)
-                ? pluginName
-                : pluginWithName.Name;
-
             var container = PManager.Plugins.FirstOrDefault(
-                plugin => plugin != null &&
-                          plugin.Name.Equals(resolvedName, StringComparison.OrdinalIgnoreCase));
+                plugin => plugin != null && !knownNames.Contains(plugin.Name));
 
-            if (container == null)
+            container ??= PManager.Plugins.FirstOrDefault(
+                plugin => plugin != null &&
+                          plugin.Name.Equals(pluginName, StringComparison.OrdinalIgnoreCase));
+
+            if (container != null)
             {
-                return false;
+                container.Metadata.Enable = true;
+                PManager.SavePluginMetadata();
             }
 
-            container.Metadata.Enable = true;
-            container.Plugin.OnEnable(Core.Process.Address != IntPtr.Zero);
-
-            var successMessage = $"Loaded plugin {container.Name} after file operations.";
+            var successMessage = $"Loaded plugin {pluginName} after file operations.";
             consoleLog?.LogInfo(successMessage);
             PluginLogger.Info(successMessage);
             return true;
