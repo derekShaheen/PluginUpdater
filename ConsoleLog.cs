@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Numerics;
-using ExileCore2.Shared;
 using ImGuiNET;
 
 namespace PluginUpdater
@@ -32,16 +31,6 @@ namespace PluginUpdater
             }
         }
 
-        public void AddNotificationMessage(string id, string message, Vector4 color)
-        {
-            lock (_logLock)
-            {
-                _logEntries.Add(new LogEntry(message, color));
-            }
-
-            PluginUpdater.Instance.PostNotification(new PluginNotification("", id, message));
-        }
-
         public void LogInfo(string message) =>
             AddLogMessage(message, ColorInfo);
 
@@ -62,7 +51,7 @@ namespace PluginUpdater
             var size = new Vector2(-1, -1);
             ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.2f, 0.2f, 0.2f, 1.0f));
             if (ImGui.BeginChild("##consolelog", size, ImGuiChildFlags.Border,
-                    PluginUpdater.Instance.Settings.WrapLogMessages
+                    PluginUpdater.Instance?.Settings.WrapLogMessages ?? true
                         ? ImGuiWindowFlags.None
                         : ImGuiWindowFlags.HorizontalScrollbar))
             {

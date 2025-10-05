@@ -1,54 +1,53 @@
-﻿using System;
-using ExileCore2;
-using ExileCore2.Shared.Attributes;
-using ExileCore2.Shared.Interfaces;
-using ExileCore2.Shared.Nodes;
+using System;
+using System.Collections.Generic;
 using Newtonsoft.Json;
+using GameHelper.Plugin;
 
 namespace PluginUpdater;
 
-public class PluginUpdaterSettings : ISettings
+public class PluginUpdaterSettings : IPSettings
 {
-    public PluginUpdaterSettings()
-    {
-        PluginConfig = new PluginRenderer(this);
-    }
+    public bool Enable { get; set; } = true;
 
-    public ToggleNode Enable { get; set; } = new ToggleNode(true);
-
-    [IgnoreMenu]
     public bool CheckUpdatesOnStartup { get; set; }
+        = false;
 
-    [IgnoreMenu]
     public bool AutoCheckUpdates { get; set; }
+        = false;
 
-    [IgnoreMenu]
-    public bool WrapLogMessages { get; set; } = true;
+    public bool WrapLogMessages { get; set; }
+        = true;
 
-    [IgnoreMenu]
-    public int UpdateCheckIntervalMinutes { get; set; } = 60;
+    public int UpdateCheckIntervalMinutes { get; set; }
+        = 60;
+
+    public Dictionary<string, string> ReleaseSources { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    public Dictionary<string, string> ReleaseChecksums { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    public Dictionary<string, string> ReleaseInstallDirectories { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    public List<string> PendingDeletionDirectories { get; set; }
+        = new();
 
     [JsonIgnore]
-    [IgnoreMenu]
     public DateTime LastUpdateCheck { get; set; } = DateTime.Now;
 
     [JsonIgnore]
-    [IgnoreMenu]
-    public bool HasCheckedUpdates { get; set; } = false;
-
-    [JsonIgnore]
-    public PluginRenderer PluginConfig { get; set; }
-
-    [JsonIgnore]
-    public GameController GameController { get; set; } // this is very lazy
+    public bool HasCheckedUpdates { get; set; }
+        = false;
 
     public bool ShouldPerformPeriodicCheck()
     {
         if (!AutoCheckUpdates)
+        {
             return false;
+        }
 
         var timeSinceLastCheck = DateTime.Now - LastUpdateCheck;
         return timeSinceLastCheck.TotalMinutes >= UpdateCheckIntervalMinutes;
     }
 }
-
